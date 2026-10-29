@@ -1,26 +1,26 @@
 # local-greptile
 
-Local PR reviewer: GitHub webhook -> Flask listener -> Ollama (`local-greptile-pro`) -> PR comment.
+Local PR reviewer: polls GitHub every minute for open PRs in `AhmedAsim-31` repos, reviews each new head commit with Ollama (`local-greptile-pro`), and posts the review as a PR comment.
+Nothing is exposed to the internet, and new repos are covered automatically.
 
 ## Files
 
-- `listener.py`: webhook server on port 5001. Symlinked from `~/greptile_listener.py`.
+- `listener.py`: the polling reviewer. Symlinked from `~/greptile_listener.py`.
 - `Modelfile`: Ollama model definition. Symlinked from `~/greptile_modelfile`.
-- `launchd/`: LaunchAgents for the listener and the ngrok tunnel. Copy into `~/Library/LaunchAgents/`.
+- `launchd/com.ahmedasim.greptile.plist`: LaunchAgent that keeps the reviewer running. Copy into `~/Library/LaunchAgents/`.
 
-## Secrets
+## State
 
-- Webhook secret: `~/.greptile_webhook_secret` (never committed).
-- GitHub token: read at request time from `gh auth token --user AhmedAsim-31`.
+- GitHub token: read each poll from `gh auth token --user AhmedAsim-31`.
 - PR code: shallow-fetched into `~/.greptile-cache/<owner>__<repo>` per review (outside `~/Desktop`, which launchd cannot read).
+- Reviewed head commits: `~/.greptile-cache/reviewed.json`. On first start, PRs already open are marked as seen. Delete an entry to force a re-review.
 
 ## Setup
 
 ```sh
 ollama create local-greptile-pro -f Modelfile
-cp launchd/*.plist ~/Library/LaunchAgents/
+cp launchd/com.ahmedasim.greptile.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ahmedasim.greptile.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ahmedasim.greptile-ngrok.plist
 ```
 
-Then add a webhook per repo (see `add-webhook.sh`).
+Logs: `/tmp/greptile_listener.log` and `/tmp/greptile_listener.err`.

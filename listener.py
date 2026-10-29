@@ -1,39 +1,39 @@
 import base64
-import hashlib
-import hmac
+import json
 import os
 import re
 import subprocess
 import tempfile
-import threading
+import time
 import requests
-from flask import Flask, request, jsonify
 
-app = Flask(__name__)
-
-GITHUB_USER = "ahmedasim-31"
+GITHUB_USER = "AhmedAsim-31"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 HOME = os.path.expanduser("~")
 CACHE = f"{HOME}/.greptile-cache"
+STATE_FILE = f"{CACHE}/reviewed.json"
+# ponytail: 1-minute polling; switch to webhooks behind a fixed tunnel if review latency matters
+POLL_SECONDS = 60
 CONTEXT_LIMIT = 60000
 INCLUDE = "**/*.js,**/*.ts,**/*.py,**/*.json"
 IGNORE = "node_modules,build,dist,.git"
-# ponytail: one global lock serializes reviews; per-repo locks if reviews start queueing
-cache_lock = threading.Lock()
-with open(f"{HOME}/.greptile_webhook_secret", "rb") as f:
-    WEBHOOK_SECRET = f.read().strip()
+SEARCH = """query($q: String!) { search(query: $q, type: ISSUE, first: 100) {
+  nodes { ... on PullRequest { number headRefOid repository { nameWithOwner } } } } }"""
 
 
 def github_token():
     return subprocess.run(
-        ["/opt/homebrew/bin/gh", "auth", "token", "--user", "AhmedAsim-31"],
+        ["/opt/homebrew/bin/gh", "auth", "token", "--user", GITHUB_USER],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
 
 
-def signature_ok(req):
-    expected = "sha256=" + hmac.new(WEBHOOK_SECRET, req.get_data(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, req.headers.get("X-Hub-Signature-256", ""))
+def open_prs(headers):
+    r = requests.post("https://api.github.com/graphql", headers=headers, timeout=30, json={
+        "query": SEARCH, "variables": {"q": f"is:pr is:open archived:false user:{GITHUB_USER}"}})
+    r.raise_for_status()
+    nodes = r.json()["data"]["search"]["nodes"]
+    return {f"{n['repository']['nameWithOwner']}#{n['number']}": n["headRefOid"] for n in nodes}
 
 
 def checkout_pr(full_name, ref, token):
@@ -67,46 +67,22 @@ def build_context(path, git_diff, tmp):
     return (context + "\n\nREST OF REPOSITORY (signatures only):\n" + rest)[:CONTEXT_LIMIT]
 
 
-@app.route("/webhook", methods=["POST"])
-def github_webhook():
-    if not signature_ok(request):
-        return jsonify({"status": "bad signature"}), 401
-    data = request.json
-    if "pull_request" not in data:
-        return jsonify({"status": "ignored, not a PR event"})
-    repo_owner = data["repository"]["owner"]["login"]
-    if repo_owner.lower() != GITHUB_USER:
-        return jsonify({"status": f"ignored, owner is {repo_owner}"})
-    action = data.get("action")
-    if action not in ["opened", "synchronize", "reopened"]:
-        return jsonify({"status": f"ignored PR action: {action}"})
+def review(full_name, pr_num, headers, token):
+    api = f"https://api.github.com/repos/{full_name}"
+    print(f"🚀 Fetching live diff for {full_name} PR #{pr_num}...", flush=True)
+    diff = requests.get(f"{api}/pulls/{pr_num}", timeout=30,
+                        headers={**headers, "Accept": "application/vnd.github.v3.diff"})
+    diff.raise_for_status()
+    git_diff = diff.text
 
-    pr_num = data["pull_request"]["number"]
-    repo_name = data["repository"]["name"]
-    comments_url = data["pull_request"]["comments_url"]
-    token = github_token()
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-
-    print(f"🚀 Fetching live diff for {repo_name} PR #{pr_num}...", flush=True)
-    diff_response = requests.get(
-        data["pull_request"]["url"],
-        headers={**headers, "Accept": "application/vnd.github.v3.diff"},
-    )
-    if diff_response.status_code != 200:
-        return jsonify({"status": "failed to fetch PR diff"}), 400
-    git_diff = diff_response.text
-
-    print(f"📁 Packing system-wide repository context for {repo_name}...", flush=True)
+    print(f"📁 Packing system-wide repository context for {full_name}...", flush=True)
     repo_context = "No system-wide context mapped."
     try:
-        with cache_lock, tempfile.TemporaryDirectory() as tmp:
-            path = checkout_pr(data["repository"]["full_name"], f"pull/{pr_num}/head", token)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = checkout_pr(full_name, f"pull/{pr_num}/head", token)
             repo_context = build_context(path, git_diff, tmp)
-    except Exception as re:
-        print(f"⚠️ Repomix context extraction skipped: {re}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Repomix context extraction skipped: {e}", flush=True)
 
     print("🧠 Processing diff with Local Greptile-Pro Engine...", flush=True)
     combined_prompt = f"""
@@ -117,31 +93,50 @@ def github_webhook():
     LIVE CHANGES (PULL REQUEST DIFF):
     {git_diff}
     """
-
-    payload = {
-        "model": "local-greptile-pro",
-        "prompt": combined_prompt,
-        "stream": False
-    }
-
-    review_markdown = "No response generated."
-    try:
-        ollama_response = requests.post(OLLAMA_URL, json=payload).json()
-        review_markdown = ollama_response.get("response", "No response generated.")
-    except Exception as e:
-        print(f"❌ Ollama error: {e}", flush=True)
+    ollama = requests.post(OLLAMA_URL, json={"model": "local-greptile-pro", "prompt": combined_prompt, "stream": False})
+    ollama.raise_for_status()
+    review_markdown = ollama.json()["response"]
 
     print("📤 Posting findings directly onto the GitHub PR...", flush=True)
-    github_payload = {
-        "body": f"### 🤖 Local Greptile Review (System Aware)\n\n{review_markdown}"
-    }
-    gh_response = requests.post(comments_url, json=github_payload, headers=headers)
-    if gh_response.status_code == 201:
-        print(f"✅ Review posted successfully to {repo_name} PR #{pr_num}!", flush=True)
-        return jsonify({"status": "review posted to github"})
-    else:
-        print(f"❌ Failed to post comment to GitHub. Status: {gh_response.status_code}", flush=True)
-        return jsonify({"status": "failed to post comment to github"}), 500
+    gh = requests.post(f"{api}/issues/{pr_num}/comments", headers=headers, timeout=30,
+                       json={"body": f"### 🤖 Local Greptile Review (System Aware)\n\n{review_markdown}"})
+    gh.raise_for_status()
+    print(f"✅ Review posted successfully to {full_name} PR #{pr_num}!", flush=True)
+
+
+def save(reviewed):
+    with open(STATE_FILE, "w") as f:
+        json.dump(reviewed, f, indent=1)
+
+
+def main():
+    os.makedirs(CACHE, exist_ok=True)
+    seeded = os.path.exists(STATE_FILE)
+    reviewed = json.load(open(STATE_FILE)) if seeded else {}
+    while True:
+        try:
+            token = github_token()
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+            prs = open_prs(headers)
+            if not seeded:
+                # First start: PRs already open are marked seen so old PRs don't all get comments at once.
+                reviewed, seeded = dict(prs), True
+                save(reviewed)
+                print(f"👀 Watching {GITHUB_USER}; {len(prs)} open PRs marked as already seen.", flush=True)
+            for key, sha in prs.items():
+                if reviewed.get(key) == sha:
+                    continue
+                full_name, num = key.split("#")
+                try:
+                    review(full_name, int(num), headers, token)
+                    reviewed[key] = sha
+                    save(reviewed)
+                except Exception as e:
+                    print(f"❌ Review of {key} failed, retrying next poll: {e}", flush=True)
+        except Exception as e:
+            print(f"❌ Poll failed: {e}", flush=True)
+        time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
-    app.run(port=5001)
+    main()
