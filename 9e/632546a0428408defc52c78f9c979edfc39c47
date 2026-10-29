@@ -1,0 +1,19 @@
+listener.py
+  s_6d954dc92bd957::t_bea69c14008e1d 1-125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9e632546a0428408defc52c78f9c979edfc39c47",
+  "prompts": {},
+  "sessions": {
+    "s_6d954dc92bd957": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9cb7b789-9d8b-4ad3-82e5-2ae74da5f7e4",
+        "model": "unknown"
+      },
+      "human_author": "Ahmed Asim <ahmedk082@gmail.com>"
+    }
+  }
+}
