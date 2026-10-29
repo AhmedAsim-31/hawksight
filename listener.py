@@ -17,8 +17,11 @@ POLL_SECONDS = 60
 CONTEXT_LIMIT = 60000
 INCLUDE = "**/*.js,**/*.ts,**/*.py,**/*.json"
 IGNORE = "node_modules,build,dist,.git"
+REVIEW_HEADER = "### 🤖 Local Greptile Review (System Aware)"
+TRIGGER = "@local-greptile"
 SEARCH = """query($q: String!) { search(query: $q, type: ISSUE, first: 100) {
-  nodes { ... on PullRequest { number headRefOid repository { nameWithOwner } } } } }"""
+  nodes { ... on PullRequest { number headRefOid repository { nameWithOwner }
+    comments(last: 30) { nodes { databaseId body author { login } } } } } } }"""
 
 
 def github_token():
@@ -32,8 +35,16 @@ def open_prs(headers):
     r = requests.post("https://api.github.com/graphql", headers=headers, timeout=30, json={
         "query": SEARCH, "variables": {"q": f"is:pr is:open archived:false user:{GITHUB_USER}"}})
     r.raise_for_status()
-    nodes = r.json()["data"]["search"]["nodes"]
-    return {f"{n['repository']['nameWithOwner']}#{n['number']}": n["headRefOid"] for n in nodes}
+    prs = {}
+    for n in r.json()["data"]["search"]["nodes"]:
+        # Only the owner's comments count, so outsiders can't trigger reviews or steer the model.
+        mine = [c for c in n["comments"]["nodes"] if (c["author"] or {}).get("login") == GITHUB_USER]
+        triggers = [c["databaseId"] for c in mine if TRIGGER in c["body"] and not c["body"].startswith(REVIEW_HEADER)]
+        last_review = max((i for i, c in enumerate(mine) if c["body"].startswith(REVIEW_HEADER)), default=None)
+        thread = "\n\n---\n\n".join(c["body"] for c in mine[last_review:]) if last_review is not None else ""
+        prs[f"{n['repository']['nameWithOwner']}#{n['number']}"] = {
+            "sha": n["headRefOid"], "trigger": max(triggers, default=None), "thread": thread}
+    return prs
 
 
 def checkout_pr(full_name, ref, token):
@@ -73,7 +84,7 @@ def set_status(full_name, sha, headers, state, description, target_url=None):
     }).raise_for_status()
 
 
-def review(full_name, pr_num, sha, headers, token):
+def review(full_name, pr_num, sha, thread, headers, token):
     api = f"https://api.github.com/repos/{full_name}"
     set_status(full_name, sha, headers, "pending", "Reviewing with local-greptile-pro...")
     print(f"🚀 Fetching live diff for {full_name} PR #{pr_num}...", flush=True)
@@ -100,13 +111,22 @@ def review(full_name, pr_num, sha, headers, token):
     LIVE CHANGES (PULL REQUEST DIFF):
     {git_diff}
     """
+    if thread:
+        combined_prompt += f"""
+    =========================================
+    YOUR PREVIOUS REVIEW AND THE AUTHOR'S REPLIES:
+    {thread}
+
+    This is a re-review. Drop findings the current diff fixes or the author's replies convincingly rebut.
+    Keep findings that still apply. Under the findings, add a "Responses" list answering each reply in one line.
+    """
     ollama = requests.post(OLLAMA_URL, json={"model": "local-greptile-pro", "prompt": combined_prompt, "stream": False})
     ollama.raise_for_status()
     review_markdown = ollama.json()["response"]
 
     print("📤 Posting findings directly onto the GitHub PR...", flush=True)
     gh = requests.post(f"{api}/issues/{pr_num}/comments", headers=headers, timeout=30,
-                       json={"body": f"### 🤖 Local Greptile Review (System Aware)\n\n{review_markdown}"})
+                       json={"body": f"{REVIEW_HEADER}\n\n{review_markdown}"})
     gh.raise_for_status()
     set_status(full_name, sha, headers, "success", "Review posted", gh.json()["html_url"])
     print(f"✅ Review posted successfully to {full_name} PR #{pr_num}!", flush=True)
@@ -128,16 +148,20 @@ def main():
             prs = open_prs(headers)
             if not seeded:
                 # First start: PRs already open are marked seen so old PRs don't all get comments at once.
-                reviewed, seeded = dict(prs), True
+                reviewed, seeded = {k: {"sha": p["sha"], "trigger": p["trigger"]} for k, p in prs.items()}, True
                 save(reviewed)
                 print(f"👀 Watching {GITHUB_USER}; {len(prs)} open PRs marked as already seen.", flush=True)
-            for key, sha in prs.items():
-                if reviewed.get(key) == sha:
+            for key, pr in prs.items():
+                seen = reviewed.get(key) or {}
+                if isinstance(seen, str):
+                    seen = {"sha": seen, "trigger": None}
+                if seen.get("sha") == pr["sha"] and (pr["trigger"] is None or pr["trigger"] == seen.get("trigger")):
                     continue
                 full_name, num = key.split("#")
+                sha = pr["sha"]
                 try:
-                    review(full_name, int(num), sha, headers, token)
-                    reviewed[key] = sha
+                    review(full_name, int(num), sha, pr["thread"], headers, token)
+                    reviewed[key] = {"sha": sha, "trigger": pr["trigger"]}
                     save(reviewed)
                 except Exception as e:
                     print(f"❌ Review of {key} failed, retrying next poll: {e}", flush=True)

@@ -9,6 +9,13 @@ Nothing is exposed to the internet, and new repos are covered automatically.
 - `Modelfile`: Ollama model definition. Symlinked from `~/greptile_modelfile`.
 - `launchd/com.ahmedasim.greptile.plist`: LaunchAgent that keeps the reviewer running. Copy into `~/Library/LaunchAgents/`.
 
+## Re-reviews
+
+- **New commit:** pushing to a PR re-reviews it on the next poll (up to ~1 minute).
+- **`@local-greptile` comment:** re-reviews the current commit. The model sees its previous review plus your replies, drops findings you fixed or rebutted, and answers each reply.
+- Only comments by `AhmedAsim-31` count, so outsiders cannot trigger reviews or steer the model.
+- Progress shows as the `local-greptile` commit status on the PR (pending, then success with a link to the review).
+
 ## State
 
 - GitHub token: read each poll from `gh auth token --user AhmedAsim-31`.
