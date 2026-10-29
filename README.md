@@ -12,6 +12,7 @@ Local PR reviewer: GitHub webhook -> Flask listener -> Ollama (`local-greptile-p
 
 - Webhook secret: `~/.greptile_webhook_secret` (never committed).
 - GitHub token: read at request time from `gh auth token --user AhmedAsim-31`.
+- PR code: shallow-fetched into `~/.greptile-cache/<owner>__<repo>` per review (outside `~/Desktop`, which launchd cannot read).
 
 ## Setup
 
