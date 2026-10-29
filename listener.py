@@ -67,8 +67,15 @@ def build_context(path, git_diff, tmp):
     return (context + "\n\nREST OF REPOSITORY (signatures only):\n" + rest)[:CONTEXT_LIMIT]
 
 
-def review(full_name, pr_num, headers, token):
+def set_status(full_name, sha, headers, state, description, target_url=None):
+    requests.post(f"https://api.github.com/repos/{full_name}/statuses/{sha}", headers=headers, timeout=30, json={
+        "state": state, "context": "local-greptile", "description": description[:140], "target_url": target_url,
+    }).raise_for_status()
+
+
+def review(full_name, pr_num, sha, headers, token):
     api = f"https://api.github.com/repos/{full_name}"
+    set_status(full_name, sha, headers, "pending", "Reviewing with local-greptile-pro...")
     print(f"🚀 Fetching live diff for {full_name} PR #{pr_num}...", flush=True)
     diff = requests.get(f"{api}/pulls/{pr_num}", timeout=30,
                         headers={**headers, "Accept": "application/vnd.github.v3.diff"})
@@ -101,6 +108,7 @@ def review(full_name, pr_num, headers, token):
     gh = requests.post(f"{api}/issues/{pr_num}/comments", headers=headers, timeout=30,
                        json={"body": f"### 🤖 Local Greptile Review (System Aware)\n\n{review_markdown}"})
     gh.raise_for_status()
+    set_status(full_name, sha, headers, "success", "Review posted", gh.json()["html_url"])
     print(f"✅ Review posted successfully to {full_name} PR #{pr_num}!", flush=True)
 
 
@@ -128,11 +136,15 @@ def main():
                     continue
                 full_name, num = key.split("#")
                 try:
-                    review(full_name, int(num), headers, token)
+                    review(full_name, int(num), sha, headers, token)
                     reviewed[key] = sha
                     save(reviewed)
                 except Exception as e:
                     print(f"❌ Review of {key} failed, retrying next poll: {e}", flush=True)
+                    try:
+                        set_status(full_name, sha, headers, "error", f"Review failed, retrying: {e}")
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"❌ Poll failed: {e}", flush=True)
         time.sleep(POLL_SECONDS)
