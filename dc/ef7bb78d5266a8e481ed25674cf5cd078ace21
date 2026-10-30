@@ -1,0 +1,21 @@
+listener.py
+  s_b004e7a68fff70::t_b7c83d472ccb54 8-10,31-61,73-74,96-102,105,109-142,157-158,161-162,164-165,168-170,172-174,176,178-181,183,186-191
+review.py
+  s_b004e7a68fff70::t_f08adb654b1310 1-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dcef7bb78d5266a8e481ed25674cf5cd078ace21",
+  "prompts": {},
+  "sessions": {
+    "s_b004e7a68fff70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7887e1d4-2c42-49cc-a3d1-06f140aa6c4f",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ahmed Asim <ahmedk082@gmail.com>"
+    }
+  }
+}
