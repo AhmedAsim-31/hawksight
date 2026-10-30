@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/ahmedkhan/greptile_listener.py</string>
+        <string>/Users/ahmedkhan/local-greptile/listener.py</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
