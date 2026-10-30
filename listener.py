@@ -90,7 +90,10 @@ def build_context(path, git_diff, tmp):
     if changed:
         context = "CHANGED FILES (full contents):\n" + repomix(path, f"{tmp}/changed.txt", ["--stdin"], "\n".join(changed))
     rest = repomix(path, f"{tmp}/rest.txt", ["--compress", "--include", INCLUDE, "--ignore", IGNORE])
-    return (context + "\n\nREST OF REPOSITORY (signatures only):\n" + rest)[:CONTEXT_LIMIT]
+    # Every tracked path, so the model doesn't claim a referenced doc or config file is missing.
+    files = subprocess.run(["git", "-C", path, "ls-files"], check=True, capture_output=True, text=True).stdout
+    return (context + "\n\nALL FILES IN THE REPOSITORY:\n" + files[:8000]
+            + "\n\nREST OF REPOSITORY (signatures only):\n" + rest)[:CONTEXT_LIMIT]
 
 
 def run_review(gh, repo, pr, view, summary_id, token):
