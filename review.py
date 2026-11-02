@@ -130,7 +130,8 @@ def run_model(prompt):
     # Thinking mode can spend the whole output budget reasoning before it writes the review.
     r = requests.post(OLLAMA_URL, timeout=1800, json={"model": MODEL, "prompt": prompt, "stream": False,
                                                       "think": False})
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"ollama {r.status_code}: {r.text[:300]}")
     data = r.json()
     if data.get("done_reason") == "length":
         raise RuntimeError("model hit the output limit (likely a repetition loop)")
