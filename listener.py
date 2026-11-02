@@ -2,7 +2,9 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -19,8 +21,9 @@ CONTEXT_LIMIT = 60000
 PROMPT_CHARS = 75000
 INCLUDE = "**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.astro,**/*.vue,**/*.svelte,**/*.py,**/*.go,**/*.rs,**/*.json,**/*.md,**/*.mdx,**/*.css,**/*.yml,**/*.yaml"
 IGNORE = "node_modules,build,dist,.git,**/package-lock.json,**/pnpm-lock.yaml,**/yarn.lock"
-TRIGGER = "/hawksight"
 OWNER = None  # the account the app reviews for; read from the app config in main()
+MENTION = None  # "@<app-slug>", the comment that asks for a re-review
+MENTION_RE = None
 
 
 def is_owner(comment):
@@ -49,7 +52,7 @@ def pr_view(node):
     return {
         "sha": node["headRefOid"],
         "threads": threads,
-        "trigger": max((c["databaseId"] for c in comments if TRIGGER in c["body"] and BOT not in c["body"]),
+        "trigger": max((c["databaseId"] for c in comments if MENTION_RE.search(c["body"]) and BOT not in c["body"]),
                        default=None),
         "reply": max((t["last_reply"] for t in threads if t["last_reply"]), default=None),
         "summary": next((c["databaseId"] for c in comments if SUMMARY in c["body"]), None),
@@ -73,7 +76,10 @@ def checkout_pr(full_name, ref, token):
 
 
 def repomix(path, out, args, stdin=None):
-    subprocess.run(["repomix", "--output", out, *args], cwd=path, input=stdin, text=True,
+    # Full path, because Windows cannot launch the repomix.cmd shim by bare name.
+    # No repomix summary or tree: they list only the packed subset, and the model read that as the whole repo.
+    subprocess.run([shutil.which("repomix") or "repomix", "--output", out, "--no-file-summary",
+                    "--no-directory-structure", *args], cwd=path, input=stdin, text=True,
                    check=True, stdout=subprocess.DEVNULL)
     with open(out) as f:
         return f.read()
@@ -81,14 +87,14 @@ def repomix(path, out, args, stdin=None):
 
 def build_context(path, git_diff, tmp):
     changed = [p for p in re.findall(r"^\+\+\+ b/(.+)$", git_diff, re.M) if os.path.isfile(f"{path}/{p}")]
-    context = ""
-    if changed:
-        context = "CHANGED FILES (full contents):\n" + repomix(path, f"{tmp}/changed.txt", ["--stdin"], "\n".join(changed))
-    rest = repomix(path, f"{tmp}/rest.txt", ["--compress", "--include", INCLUDE, "--ignore", IGNORE])
-    # Every tracked path, so the model doesn't claim a referenced doc or config file is missing.
+    # Every tracked path first, so the model doesn't claim a referenced doc or config file is missing.
     files = subprocess.run(["git", "-C", path, "ls-files"], check=True, capture_output=True, text=True).stdout
-    return (context + "\n\nALL FILES IN THE REPOSITORY:\n" + files[:8000]
-            + "\n\nREST OF REPOSITORY (signatures only):\n" + rest)[:CONTEXT_LIMIT]
+    context = "ALL FILES IN THE REPOSITORY (complete list):\n" + files[:8000]
+    if changed:
+        context += "\n\nCHANGED FILES (full contents):\n" + repomix(path, f"{tmp}/changed.txt", ["--stdin"],
+                                                                     "\n".join(changed))
+    rest = repomix(path, f"{tmp}/rest.txt", ["--compress", "--include", INCLUDE, "--ignore", IGNORE])
+    return (context + "\n\nOTHER FILES (signatures only):\n" + rest)[:CONTEXT_LIMIT]
 
 
 def run_review(gh, repo, pr, view, summary_id, token):
@@ -140,7 +146,7 @@ def run_review(gh, repo, pr, view, summary_id, token):
                         "severity": f["severity"], "title": f["title"], "line": line})
 
     value = review.score([t["severity"] for t in threads if not t["resolved"]])
-    summary_id, url = gh.upsert_summary(repo, pr, summary_id, review.summary_body(out["summary"], value, threads, sha))
+    summary_id, url = gh.upsert_summary(repo, pr, summary_id, review.summary_body(out["summary"], value, threads, sha, MENTION))
     n_open = sum(not t["resolved"] for t in threads)
     gh.status(repo, sha, "success", f"Score {value}/5 · {n_open} open findings", url)
     print(f"✅ {repo} PR #{pr}: score {value}/5, {n_open} open", flush=True)
@@ -153,7 +159,7 @@ def save(reviewed):
 
 
 def due(seen, view):
-    """A PR is due when it has a commit, /hawksight comment or thread reply not yet reviewed."""
+    """A PR is due when it has a commit, mention of the app or thread reply not yet reviewed."""
     return not (seen.get("sha") == view["sha"] and view["trigger"] in (None, seen.get("trigger"))
                 and view["reply"] in (None, seen.get("reply")))
 
@@ -168,8 +174,11 @@ def queued_label(ahead):
 
 
 def main():
-    global OWNER
-    OWNER = app_config()["owner"]
+    global OWNER, MENTION, MENTION_RE
+    app = app_config()
+    OWNER, MENTION = app["owner"], f"@{app['slug']}"
+    # Either "@hawksight-bot" or "@hawksightbot" works for a slug like "hawksight-bot".
+    MENTION_RE = re.compile(rf"@({re.escape(app['slug'])}|{re.escape(app['slug'].replace('-', ''))})\b", re.I)
     os.makedirs(CACHE, exist_ok=True)
     seeded = os.path.exists(STATE_FILE)
     reviewed = json.load(open(STATE_FILE)) if seeded else {}
@@ -210,8 +219,11 @@ def main():
                 # queue a few times, then give up until a new commit or trigger so a deterministic failure can't loop.
                 fails = seen.get("fails", 0) + 1
                 print(f"❌ Review of {key} failed ({fails}/3): {e}", flush=True)
+                # A reviewer crash is not a code failure, so the status never turns the PR red.
+                state, text = (("pending", f"Review failed ({fails}/3), retrying") if fails < 3 else
+                               ("success", f"Not reviewed after 3 attempts; comment {MENTION} to retry"))
                 try:
-                    gh.status(repo, view["sha"], "error", f"Review failed, comment {TRIGGER} to retry: {e}")
+                    gh.status(repo, view["sha"], state, f"{text}: {e}")
                 except Exception:
                     pass
                 if fails < 3:
@@ -227,4 +239,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        # Log file for runners without a console, such as pythonw on Windows.
+        sys.stdout = sys.stderr = open(sys.argv[1], "a", buffering=1)
     main()

@@ -6,10 +6,11 @@ import requests
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "hawksight"
 SEVERITIES = ("P0", "P1", "P2")
+MAX_FINDINGS = 8
 FINDING_RE = re.compile(r"<!-- hawksight:finding (\{.*?\}) -->")
 TASK = """TASK:
 1. For each existing finding, decide its status: "fixed" if the current code no longer has the problem, "rebutted" if the author's reply convincingly shows it is not a problem, otherwise "open". Write a one-line reply to the author when the status is not "open" or the author replied; otherwise write "-".
-2. List new problems. Never repeat an existing finding. Each needs the file path, a line number taken from the numbered diff, a severity, a short title, and a markdown body that explains what goes wrong and shows the fix once.
+2. List new problems, at most 8, most severe first. Never repeat an existing finding. Each needs the file path, a line number taken from the numbered diff, a severity, a short title, and a markdown body that explains what goes wrong and shows the fix once.
    Severity:
    - P0 (Critical): security vulnerabilities (SQL injection, XSS, exposed tokens or keys), data loss, crashes on a main path.
    - P1 (Important): logic errors, race conditions (check-then-act), unawaited promises, missing edge-case handling.
@@ -172,9 +173,11 @@ def verify(context, numbered_diff, f):
 
 def run_model(prompt):
     data = _generate(prompt)
-    if data.get("done_reason") == "length":
-        raise RuntimeError("model hit the output limit (likely a repetition loop)")
     out = parse_output(data["response"])
+    if data.get("done_reason") == "length":
+        # A runaway list of findings: keep the finished ones and drop the last, which may be cut off.
+        out["new"] = out["new"][:-1]
+    out["new"] = out["new"][:MAX_FINDINGS]
     if not out["summary"]:
         # An unparseable answer would otherwise post as a clean 5/5.
         raise RuntimeError(f"model ignored the output format: {data['response'][:300]!r}")
@@ -195,7 +198,7 @@ def bot(text):
     return f"{text}\n\n<!-- hawksight -->"
 
 
-def summary_body(summary, value, threads, sha):
+def summary_body(summary, value, threads, sha, mention):
     open_ = [t["severity"] for t in threads if not t["resolved"]]
     counts = " · ".join(f"{open_.count(s)} {s}" for s in SEVERITIES)
     rows = "\n".join(
@@ -211,7 +214,7 @@ def summary_body(summary, value, threads, sha):
 
 {table}
 
-<sub>5/5 needs every finding resolved and no new ones. Reply in a finding's thread to discuss it; push a commit or comment `/hawksight` to re-review.</sub>"""
+<sub>5/5 needs every finding resolved and no new ones. Reply in a finding's thread to discuss it; push a commit or comment `{mention}` to re-review.</sub>"""
 
 
 if __name__ == "__main__":
