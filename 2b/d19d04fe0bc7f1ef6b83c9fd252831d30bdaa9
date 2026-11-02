@@ -1,0 +1,27 @@
+README.md
+  s_57f2057725f135::t_415fde4c5f3d0f 1-2,5,26-27,32-34,42,61,73,79,85,91-92,121-122,129
+docs/install-linux.md
+  s_57f2057725f135::t_03889d09e91e1a 1-61
+docs/install-windows.md
+  s_57f2057725f135::t_965cf8719889f6 1-57
+listener.py
+  s_57f2057725f135::t_02dc9250c0ae0a 5,7,25-26,55,79-82,90-92,94-95,97,149,162,177-181,222-224,226,242-244
+review.py
+  s_57f2057725f135::t_555af00c1a29ef 9,13,177-180,201,217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2bd19d04fe0bc7f1ef6b83c9fd252831d30bdaa9",
+  "prompts": {},
+  "sessions": {
+    "s_57f2057725f135": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c1297f9-9622-4a85-a65f-bd41be99f644",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ahmed Asim <ahmedk082@gmail.com>"
+    }
+  }
+}
