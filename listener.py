@@ -16,6 +16,8 @@ STATE_FILE = f"{CACHE}/reviewed.json"
 # ponytail: 1-minute polling; switch to webhooks behind a fixed tunnel if review latency matters
 POLL_SECONDS = 60
 CONTEXT_LIMIT = 60000
+# ~3.7 chars/token: keeps the prompt near 23k tokens so num_predict 6000 fits the 32k window.
+PROMPT_CHARS = 85000
 INCLUDE = "**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.astro,**/*.vue,**/*.svelte,**/*.py,**/*.go,**/*.rs,**/*.json,**/*.md,**/*.mdx,**/*.css,**/*.yml,**/*.yaml"
 IGNORE = "node_modules,build,dist,.git,**/package-lock.json,**/pnpm-lock.yaml,**/yarn.lock"
 TRIGGER = "/hawksight"
@@ -102,6 +104,8 @@ def run_review(gh, repo, pr, view, summary_id, token):
     except Exception as e:
         print(f"⚠️ Repomix context extraction skipped: {e}", flush=True)
 
+    # ponytail: a diff over PROMPT_CHARS alone still overflows; chunk the diff per file if that happens.
+    context = context[:max(0, PROMPT_CHARS - len(numbered))]
     open_threads = {f"F{i + 1}": t for i, t in enumerate(t for t in threads if not t["resolved"])}
     existing = [{**t, "id": k} for k, t in open_threads.items()]
     print(f"🧠 Model call ({len(existing)} open findings)...", flush=True)
