@@ -36,6 +36,21 @@ body:
 <markdown explanation and fix>
 
 Repeat the EXISTING block once per existing finding and the FINDING block once per new problem. Write no FINDING block if there are no new problems."""
+VERIFY = """A reviewer raised the finding below on this pull request. Check it against the repository context and the diff above.
+It is false if any of these hold:
+- it describes removed lines (starting with "-") as the current code;
+- something it says is missing, unused or unhandled exists anywhere in the context or the diff;
+- it objects to a change the diff makes on purpose;
+- it is about wording, naming, formatting or style;
+- it admits the problem is minor, hypothetical or not a bug.
+Answer real only if you can name the exact current line that misbehaves and the input that triggers it.
+
+FINDING ({severity}) {path}:{line} {title}
+{body}
+
+Answer in exactly this format and nothing else:
+VERDICT: real|false
+REASON: <one line>"""
 
 
 def parse_output(text):
@@ -104,14 +119,8 @@ def score(open_severities):
     return 4 if open_severities else 5
 
 
-def build_prompt(context, numbered_diff, existing):
-    items = []
-    for e in existing:
-        replies = "\n".join(f"    Author reply: {r}" for r in e["replies"]) or "    (no author reply)"
-        items.append(f"[{e['id']}] {e['severity']} {e['path']}:{e['line']} {e['title']}\n{e['body']}\n{replies}")
-    ids = ", ".join(e["id"] for e in existing)
-    required = (f"\nWrite one EXISTING block for each of {ids}, and do not list any of them again as a FINDING."
-                if existing else "")
+def _prefix(context, numbered_diff):
+    # Review and verify prompts share this prefix, so Ollama reuses its KV cache across the calls.
     return f"""REPOSITORY CONTEXT:
 {context}
 
@@ -120,19 +129,49 @@ PULL REQUEST DIFF (new-file line numbers on the left; removed lines have none):
 {numbered_diff}
 
 =========================================
-EXISTING FINDINGS FROM YOUR EARLIER REVIEWS:
+"""
+
+
+def build_prompt(context, numbered_diff, existing):
+    items = []
+    for e in existing:
+        replies = "\n".join(f"    Author reply: {r}" for r in e["replies"]) or "    (no author reply)"
+        items.append(f"[{e['id']}] {e['severity']} {e['path']}:{e['line']} {e['title']}\n{e['body']}\n{replies}")
+    ids = ", ".join(e["id"] for e in existing)
+    required = (f"\nWrite one EXISTING block for each of {ids}, and do not list any of them again as a FINDING."
+                if existing else "")
+    return f"""{_prefix(context, numbered_diff)}EXISTING FINDINGS FROM YOUR EARLIER REVIEWS:
 {chr(10).join(items) or "None."}
 
 {TASK}{required}"""
 
 
-def run_model(prompt):
+def _generate(prompt, **options):
     # Thinking mode can spend the whole output budget reasoning before it writes the review.
     r = requests.post(OLLAMA_URL, timeout=1800, json={"model": MODEL, "prompt": prompt, "stream": False,
-                                                      "think": False})
+                                                      "think": False, "options": options})
     if not r.ok:
         raise RuntimeError(f"ollama {r.status_code}: {r.text[:300]}")
-    data = r.json()
+    return r.json()
+
+
+def parse_verdict(text):
+    """True/False for a real/false verdict, None when the answer does not follow the format."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    m = re.search(r"^\W*VERDICT\W*:?\W*(real|false)\b", text, re.M | re.I)
+    reason = re.search(r"^\W*REASON\W*:?\s*(.+)$", text, re.M | re.I)
+    return (m.group(1).lower() == "real") if m else None, reason.group(1).strip() if reason else ""
+
+
+def verify(context, numbered_diff, f):
+    """Second pass that drops findings the code contradicts; an unreadable verdict keeps the finding."""
+    data = _generate(_prefix(context, numbered_diff) + VERIFY.format(**f), num_predict=200)
+    real, reason = parse_verdict(data["response"])
+    return real is not False, reason
+
+
+def run_model(prompt):
+    data = _generate(prompt)
     if data.get("done_reason") == "length":
         raise RuntimeError("model hit the output limit (likely a repetition loop)")
     out = parse_output(data["response"])
@@ -188,4 +227,8 @@ if __name__ == "__main__":
     assert parsed == {"summary": "Adds X.", "existing": [{"id": "F1", "status": "rebutted", "reply": "Agreed, style rule."}],
                       "new": [{"path": "a.py", "line": 11, "severity": "P1", "title": "Bug",
                                "body": "Use `<`.\n\n```py\nx: 1\n```"}]}, parsed
+    assert parse_verdict("VERDICT: false\nREASON: The link exists in the layout.") == (False, "The link exists in the layout.")
+    assert parse_verdict("**VERDICT:** Real\n**REASON:** SQL built by f-string.")[0] is True
+    assert parse_verdict("I think this is fine.") == (None, "")
+    assert _prefix("C", "D") in build_prompt("C", "D", [])
     print("ok")

@@ -130,6 +130,11 @@ def run_review(gh, repo, pr, view, summary_id, token):
         # compare titles too if distinct bugs on adjacent lines get swallowed.
         if any(t["path"] == f["path"] and line and t["line"] and abs(t["line"] - line) <= 2 for t in threads):
             continue
+        real, reason = review.verify(context, numbered, f)
+        print(f"{'✔️ kept' if real else '🗑️ dropped'} {f['severity']} {f['path']}:{f['line']} {f['title']}: {reason}",
+              flush=True)
+        if not real:
+            continue
         c = gh.inline(repo, pr, sha, f["path"], line, review.finding_body(f))
         threads.append({"url": c["html_url"], "path": f["path"], "resolved": False,
                         "severity": f["severity"], "title": f["title"], "line": line})

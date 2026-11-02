@@ -7,6 +7,7 @@ Code never leaves the machine except to GitHub itself, nothing is exposed to the
 ## How a review looks
 
 - **One summary comment per PR**, edited in place on every review: score, two-sentence summary, and a table of findings linking to their threads.
+- **Every finding is verified before it posts**: a second model call checks it against the code and drops it if it misreads removed lines, claims something is missing that exists, objects to a deliberate change, or is about wording or style. The call shares the review prompt prefix, so Ollama reuses its cache and each check takes about 5 s.
 - **One inline comment per finding** on its diff line (or on the file when the line is outside the diff), with severity, explanation, and fix.
 - **Score out of 5**, computed from open findings, not guessed by the model: 5 = nothing open, 4 = only P2, 3 = a P1, 2 = one P0, 1 = two or more P0.
   5/5 needs every finding resolved and no new ones.
