@@ -1,0 +1,19 @@
+docs/logo.svg
+  s_57f2057725f135::t_7c6de9d3f3bf58 1-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "670d76e42ac8a63b4e9ed6f130fda592d6455806",
+  "prompts": {},
+  "sessions": {
+    "s_57f2057725f135": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c1297f9-9622-4a85-a65f-bd41be99f644",
+        "model": "unknown"
+      },
+      "human_author": "Ahmed Asim <ahmedk082@gmail.com>"
+    }
+  }
+}
