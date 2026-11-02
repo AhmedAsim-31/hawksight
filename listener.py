@@ -16,8 +16,8 @@ STATE_FILE = f"{CACHE}/reviewed.json"
 # ponytail: 1-minute polling; switch to webhooks behind a fixed tunnel if review latency matters
 POLL_SECONDS = 60
 CONTEXT_LIMIT = 60000
-# ~3.7 chars/token: keeps the prompt near 23k tokens so num_predict 6000 fits the 32k window.
-PROMPT_CHARS = 85000
+# ~3.3 chars/token measured: keeps the prompt near 24k tokens so num_predict 6000 fits the 32k window.
+PROMPT_CHARS = 75000
 INCLUDE = "**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.astro,**/*.vue,**/*.svelte,**/*.py,**/*.go,**/*.rs,**/*.json,**/*.md,**/*.mdx,**/*.css,**/*.yml,**/*.yaml"
 IGNORE = "node_modules,build,dist,.git,**/package-lock.json,**/pnpm-lock.yaml,**/yarn.lock"
 TRIGGER = "/hawksight"

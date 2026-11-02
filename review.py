@@ -134,7 +134,11 @@ def run_model(prompt):
     data = r.json()
     if data.get("done_reason") == "length":
         raise RuntimeError("model hit the output limit (likely a repetition loop)")
-    return parse_output(data["response"])
+    out = parse_output(data["response"])
+    if not out["summary"]:
+        # An unparseable answer would otherwise post as a clean 5/5.
+        raise RuntimeError(f"model ignored the output format: {data['response'][:300]!r}")
+    return out
 
 
 def finding_body(f):
