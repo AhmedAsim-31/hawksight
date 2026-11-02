@@ -1,0 +1,26 @@
+Modelfile
+  h_78e539a96187c3 7
+README.md
+  h_78e539a96187c3 1,3-4,13,19,26-27,29,33-35,37,47-53,56
+create_app.py
+  h_78e539a96187c3 1-54
+gh_api.py
+  h_78e539a96187c3 1-6,10-12,20-41,67
+launchd/com.ahmedasim.hawksight.plist
+  h_78e539a96187c3 6,10,22,24
+listener.py
+  h_78e539a96187c3 10,14,19-21,94,152
+review.py
+  h_78e539a96187c3 7,9,17-18,142,151,161-162,170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a15e788ef18ab6de27123b8256d7401d2e4c6290",
+  "prompts": {},
+  "humans": {
+    "h_78e539a96187c3": {
+      "author": "Ahmed Asim <ahmedk082@gmail.com>"
+    }
+  }
+}
