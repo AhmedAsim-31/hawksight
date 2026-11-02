@@ -115,7 +115,7 @@ def run_review(gh, repo, pr, view, summary_id, token):
     open_threads = {f"F{i + 1}": t for i, t in enumerate(t for t in threads if not t["resolved"])}
     existing = [{**t, "id": k} for k, t in open_threads.items()]
     print(f"🧠 Model call ({len(existing)} open findings)...", flush=True)
-    out = review.run_model(review.build_prompt(context, numbered, existing))
+    out = review.run_model(context, numbered, existing)
 
     for item in out["existing"]:
         t = open_threads.get(item["id"])
