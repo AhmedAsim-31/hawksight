@@ -6,10 +6,16 @@ import requests
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "hawksight"
 SEVERITIES = ("P0", "P1", "P2")
+MAX_FINDINGS = 8
 FINDING_RE = re.compile(r"<!-- hawksight:finding (\{.*?\}) -->")
+SYSTEM = """You are hawksight, a senior code reviewer. You review pull requests using the diff and the wider repository context you are given.
+Report only real problems: bugs, security holes, exposed secrets, race conditions, data loss, broken contracts, and clear maintainability issues. Skip style preferences a formatter or linter already enforces.
+Be concrete: point at the exact line, explain what goes wrong and when, and show the fix.
+Judge author replies on their merits: drop a finding the reply shows is wrong, and keep a finding the reply does not refute.
+Always answer in the exact format the request specifies."""
 TASK = """TASK:
 1. For each existing finding, decide its status: "fixed" if the current code no longer has the problem, "rebutted" if the author's reply convincingly shows it is not a problem, otherwise "open". Write a one-line reply to the author when the status is not "open" or the author replied; otherwise write "-".
-2. List new problems. Never repeat an existing finding. Each needs the file path, a line number taken from the numbered diff, a severity, a short title, and a markdown body that explains what goes wrong and shows the fix once.
+2. List new problems, at most 8, most severe first. Never repeat an existing finding. Each needs the file path, a line number taken from the numbered diff, a severity, a short title, and a markdown body that explains what goes wrong and shows the fix once.
    Severity:
    - P0 (Critical): security vulnerabilities (SQL injection, XSS, exposed tokens or keys), data loss, crashes on a main path.
    - P1 (Important): logic errors, race conditions (check-then-act), unawaited promises, missing edge-case handling.
@@ -36,6 +42,18 @@ body:
 <markdown explanation and fix>
 
 Repeat the EXISTING block once per existing finding and the FINDING block once per new problem. Write no FINDING block if there are no new problems."""
+REFORMAT = """Your review below did not use the required format. Rewrite every problem it reports as a FINDING block, at most 8, and nothing else:
+
+### FINDING
+path: <file path>
+line: <number from the numbered diff>
+severity: P0|P1|P2
+title: <short title>
+body:
+<markdown explanation and fix>
+
+YOUR REVIEW:
+{review}"""
 VERIFY = """A reviewer raised the finding below on this pull request. Check it against the repository context and the diff above.
 It is false if any of these hold:
 - it describes removed lines (starting with "-") as the current code;
@@ -49,8 +67,8 @@ FINDING ({severity}) {path}:{line} {title}
 {body}
 
 Answer in exactly this format and nothing else:
-VERDICT: real|false
-REASON: <one line>"""
+REASON: <one line naming the line you checked>
+VERDICT: real|false"""
 
 
 def parse_output(text):
@@ -146,13 +164,18 @@ def build_prompt(context, numbered_diff, existing):
 {TASK}{required}"""
 
 
-def _generate(prompt, **options):
-    # Thinking mode can spend the whole output budget reasoning before it writes the review.
-    r = requests.post(OLLAMA_URL, timeout=1800, json={"model": MODEL, "prompt": prompt, "stream": False,
-                                                      "think": False, "options": options})
+def _generate(prompt, prefill, **options):
+    # Raw ChatML so the answer starts with our prefill: the model can't open with prose or a tool call.
+    # The empty think block turns thinking off, which could spend the whole output budget.
+    chat = (f"<|im_start|>system\n{SYSTEM}<|im_end|><|im_start|>user\n{prompt}<|im_end|>"
+            f"<|im_start|>assistant\n<think></think>{prefill}")
+    r = requests.post(OLLAMA_URL, timeout=1800, json={"model": MODEL, "prompt": chat, "raw": True, "stream": False,
+                                                      "options": {"stop": ["<|im_end|>"], **options}})
     if not r.ok:
         raise RuntimeError(f"ollama {r.status_code}: {r.text[:300]}")
-    return r.json()
+    data = r.json()
+    data["response"] = prefill + data["response"]
+    return data
 
 
 def parse_verdict(text):
@@ -165,16 +188,29 @@ def parse_verdict(text):
 
 def verify(context, numbered_diff, f):
     """Second pass that drops findings the code contradicts; an unreadable verdict keeps the finding."""
-    data = _generate(_prefix(context, numbered_diff) + VERIFY.format(**f), num_predict=200)
-    real, reason = parse_verdict(data["response"])
+    prompt = _prefix(context, numbered_diff) + VERIFY.format(**f)
+    # Unprefilled first: prefilling "VERDICT:" or "REASON:" made the check keep false findings on the bench PR.
+    real, reason = parse_verdict(_generate(prompt, "", num_predict=200)["response"])
+    if real is None:
+        # The model drifted into writing a review; pin the answer to the format and ask once more.
+        real, reason = parse_verdict(_generate(prompt, "REASON:", num_predict=200)["response"])
     return real is not False, reason
 
 
-def run_model(prompt):
-    data = _generate(prompt)
-    if data.get("done_reason") == "length":
-        raise RuntimeError("model hit the output limit (likely a repetition loop)")
+def run_model(context, numbered_diff, existing):
+    data = _generate(build_prompt(context, numbered_diff, existing), "### SUMMARY\n")
     out = parse_output(data["response"])
+    if not out["new"] and re.search(r"^#+ (?!SUMMARY|EXISTING|FINDING)", data["response"], re.M):
+        # The model wrote its own sections (e.g. "### DETAILS"); have it restate them as findings.
+        fixed = _generate(_prefix(context, numbered_diff) + REFORMAT.format(review=data["response"]),
+                          "### FINDING\npath:")
+        out["new"] = parse_output(fixed["response"])["new"]
+    if data.get("done_reason") == "length":
+        if not out["new"]:
+            raise RuntimeError("model hit the output limit without a usable finding (likely a loop)")
+        # A runaway list of findings: keep the finished ones and drop the last, which may be cut off.
+        out["new"] = out["new"][:-1]
+    out["new"] = out["new"][:MAX_FINDINGS]
     if not out["summary"]:
         # An unparseable answer would otherwise post as a clean 5/5.
         raise RuntimeError(f"model ignored the output format: {data['response'][:300]!r}")
@@ -195,7 +231,7 @@ def bot(text):
     return f"{text}\n\n<!-- hawksight -->"
 
 
-def summary_body(summary, value, threads, sha):
+def summary_body(summary, value, threads, sha, mention):
     open_ = [t["severity"] for t in threads if not t["resolved"]]
     counts = " · ".join(f"{open_.count(s)} {s}" for s in SEVERITIES)
     rows = "\n".join(
@@ -211,7 +247,7 @@ def summary_body(summary, value, threads, sha):
 
 {table}
 
-<sub>5/5 needs every finding resolved and no new ones. Reply in a finding's thread to discuss it; push a commit or comment `/hawksight` to re-review.</sub>"""
+<sub>5/5 needs every finding resolved and no new ones. Reply in a finding's thread to discuss it; push a commit or comment `{mention}` to re-review.</sub>"""
 
 
 if __name__ == "__main__":

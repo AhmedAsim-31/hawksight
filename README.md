@@ -1,6 +1,8 @@
+<p align="center"><img src="docs/logo.png" width="128" alt="hawksight logo"></p>
+
 # hawksight
 
-A free, self-hosted AI reviewer for GitHub pull requests that runs entirely on your Mac.
+A free, self-hosted AI reviewer for GitHub pull requests that runs entirely on your own machine.
 It reviews like Greptile: one summary comment with a score, one inline thread per finding, and threads that resolve themselves when you fix or rebut them.
 Your code goes to GitHub and nowhere else: the model runs locally through Ollama, and nothing listens on the internet.
 
@@ -13,16 +15,22 @@ Your code goes to GitHub and nowhere else: the model runs locally through Ollama
 - **A score out of 5, computed from open findings**, not guessed by the model: 5 means nothing is open, 4 only P2, 3 a P1, 2 one P0, and 1 two or more P0.
   A 5/5 needs every finding resolved and no new ones.
 - **A commit status** (`hawksight`) shows progress, then the score with a link to the summary.
+- **One review at a time.**
+  Pull requests waiting their turn show a pending status with their place in the queue, such as "Queued: 2 reviews ahead".
 - **Comments come from your own GitHub App**, so they show as `<your-app>[bot]`, not as you.
 
 ## Re-reviews
 
 - **Push a commit:** hawksight re-reviews on its next poll. Findings the new code fixes get a reply, and their threads are resolved.
 - **Reply in a finding's thread:** the model answers in that thread. A reply that convincingly rebuts the finding resolves it, and a resolved finding is not raised again on the same lines.
-- **Comment `/hawksight`** on the PR to re-review the current commit.
+- **Mention the app** on the PR to re-review the current commit: `@<your-app>`, or the same name without dashes.
+  For an app named `hawksight-bot`, both `@hawksight-bot` and `@hawksightbot` work.
 - Only comments from the account the app is installed on count, so outsiders cannot trigger reviews or steer the model.
 
 ## Requirements
+
+These are for macOS, the tested path.
+For Linux and Windows, see [docs/install-linux.md](docs/install-linux.md) and [docs/install-windows.md](docs/install-windows.md).
 
 - macOS on Apple silicon with 16 GB of memory or more.
   The default model uses about 6 GB while it reviews.
@@ -31,7 +39,7 @@ Your code goes to GitHub and nowhere else: the model runs locally through Ollama
 - The [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli), once, to download the model: `brew install hf`.
 - About 6 GB of free disk space for the model.
 
-## Install
+## Install on macOS
 
 1. Clone the repository somewhere outside `~/Desktop`, `~/Documents` and `~/Downloads`, which macOS blocks background agents from reading:
 
@@ -50,6 +58,7 @@ Your code goes to GitHub and nowhere else: the model runs locally through Ollama
    A browser tab opens with the app form already filled in.
    Click **Create GitHub App**, then follow the **install it** link and choose **All repositories** (or pick some).
    The app's private key is saved to `~/.hawksight/app.pem`, readable only by you.
+   Optional: upload [docs/logo.png](docs/logo.png) under **Display information** in the app's settings, so its comments and statuses show the hawk instead of your profile picture.
 
 3. Run the installer:
 
@@ -61,25 +70,26 @@ Your code goes to GitHub and nowhere else: the model runs locally through Ollama
 
 4. Open a pull request in any repository the app is installed on.
    The first review appears within a few minutes.
-   Pull requests that were already open when hawksight first started are skipped until their next commit or a `/hawksight` comment.
+   Pull requests that were already open when hawksight first started are skipped until their next commit or a mention of the app.
 
 ## Day-to-day
 
 - Logs: `tail -f ~/Library/Logs/hawksight.log`.
 - Restart after changing the code: `launchctl kickstart -k gui/$(id -u)/com.hawksight.listener`.
-- Force a re-review: comment `/hawksight`, or delete the PR's entry from `~/.hawksight/reviewed.json`.
+- Force a re-review: mention the app in a comment, or delete the PR's entry from `~/.hawksight/reviewed.json`.
 - Uninstall: `launchctl bootout gui/$(id -u)/com.hawksight.listener && rm ~/Library/LaunchAgents/com.hawksight.listener.plist`, then delete `~/.hawksight` and the app in your GitHub settings.
 
 ## How it works
 
 - `listener.py` polls GitHub every 60 seconds for open pull requests on the app owner's repositories.
-  A new commit, a `/hawksight` comment, or your reply in a finding's thread starts a review.
+  A new commit, a comment that mentions the app, or your reply in a finding's thread starts a review.
 - It shallow-fetches the PR into `~/.hawksight/<owner>__<repo>` and builds the context with repomix: the full contents of the changed files, a list of every tracked file, and signatures for the rest of the repository.
   The prompt is capped at about 24k tokens so the answer fits the model's 32k window.
 - `review.py` numbers the diff lines, asks the model for findings and for a verdict on each earlier finding, and then verifies every new finding with a second call.
   The verification prompt shares the review prompt's prefix, so Ollama reuses its cache and each check takes about 5 seconds.
 - `gh_api.py` mints a one-hour installation token from the app key on every poll, then posts inline comments, replies, resolves threads, edits the summary and sets the commit status.
-- A failed review (network error, or a model answer that loops or ignores the format) retries on the next two polls, then waits for a new commit or a `/hawksight` comment.
+- A failed review (network error, or a model answer that loops or ignores the format) goes to the back of the queue and retries twice, then waits for a new commit or a mention.
+  Its status stays pending while it retries and ends as "Not reviewed" rather than a failure, so a reviewer crash never turns your PR red.
   A broken answer is never posted as a clean review.
 - Findings live on GitHub.
   Inline comments carry a hidden `<!-- hawksight:finding ... -->` marker, and every reviewer comment carries `<!-- hawksight -->`.
@@ -107,15 +117,16 @@ With more memory, a larger model such as Qwen3.6-35B-A3B should review noticeabl
 - A 9B model still produces some false positives and misses some bugs, especially on large diffs.
   The verification pass removes most of the noise, but it cannot add bugs the review missed.
 - Diffs larger than about 75,000 characters leave no room for repository context and can overflow the model's window.
-- Reviews take 1 to 3 minutes each, one at a time.
-- macOS only, because of the LaunchAgent.
-  `listener.py` itself runs anywhere Python and Ollama do.
+- Reviews take 1 to 3 minutes each, one at a time, so a busy queue can take a while.
+- The installer is macOS only.
+  Linux and Windows have manual, untested steps, and without a GPU a review there can take 20 minutes or longer.
 - Tested on personal accounts.
   Organization installs should work but are untested.
 
 ## Development
 
 `python3 review.py` runs the self-check: diff numbering, score, finding markers, and the output and verdict parsers.
+`python3 test_listener.py` checks when a PR is due for review, the queue order, and mention triggers.
 
 ## License
 

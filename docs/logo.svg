@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="112" fill="#0f2a2e"/>
+  <!-- head: crown sweeps back to the nape, hooked beak points left -->
+  <path d="M120 250 C130 170 210 112 300 112 C380 112 430 170 430 250 C430 330 392 392 330 420 L236 420 C220 380 206 336 196 300 C170 302 150 296 138 282 Z" fill="#c7782f"/>
+  <path d="M300 112 C380 112 430 170 430 250 C430 330 392 392 330 420 L292 420 C350 380 380 320 378 250 C376 180 340 130 300 112 Z" fill="#8a4b1c"/>
+  <!-- beak -->
+  <path d="M138 282 C110 262 92 268 84 296 C80 316 92 336 110 340 C104 322 110 306 126 300 C150 312 176 312 196 300 Z" fill="#f2c14e"/>
+  <path d="M84 296 C80 316 92 336 110 340 C104 322 110 306 126 300 Z" fill="#c89a2c"/>
+  <!-- brow ridge and eye -->
+  <path d="M190 206 C228 178 286 178 318 204 C286 198 240 202 206 226 Z" fill="#3b2412"/>
+  <circle cx="258" cy="236" r="34" fill="#f2c14e"/>
+  <circle cx="252" cy="236" r="17" fill="#111"/>
+  <circle cx="246" cy="229" r="6" fill="#fff"/>
+  <!-- cheek stripe -->
+  <path d="M232 280 C252 300 262 330 256 360 C246 334 232 312 214 296 Z" fill="#3b2412"/>
+</svg>
