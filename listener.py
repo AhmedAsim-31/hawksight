@@ -7,9 +7,8 @@ import tempfile
 import time
 
 import review
-from gh_api import BOT, SUMMARY, GitHub, app_token
+from gh_api import BOT, SUMMARY, GitHub, app_config, app_token
 
-GITHUB_USER = "AhmedAsim-31"
 HOME = os.path.expanduser("~")
 CACHE = f"{HOME}/.hawksight"
 STATE_FILE = f"{CACHE}/reviewed.json"
@@ -21,11 +20,12 @@ PROMPT_CHARS = 75000
 INCLUDE = "**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.astro,**/*.vue,**/*.svelte,**/*.py,**/*.go,**/*.rs,**/*.json,**/*.md,**/*.mdx,**/*.css,**/*.yml,**/*.yaml"
 IGNORE = "node_modules,build,dist,.git,**/package-lock.json,**/pnpm-lock.yaml,**/yarn.lock"
 TRIGGER = "/hawksight"
+OWNER = None  # the account the app reviews for; read from the app config in main()
 
 
 def is_owner(comment):
     # Only the owner's comments count, so outsiders can't trigger reviews or steer the model.
-    return (comment["author"] or {}).get("login") == GITHUB_USER
+    return (comment["author"] or {}).get("login") == OWNER
 
 
 def pr_view(node):
@@ -153,20 +153,22 @@ def save(reviewed):
 
 
 def main():
+    global OWNER
+    OWNER = app_config()["owner"]
     os.makedirs(CACHE, exist_ok=True)
     seeded = os.path.exists(STATE_FILE)
     reviewed = json.load(open(STATE_FILE)) if seeded else {}
     while True:
         try:
-            token = app_token(GITHUB_USER)
+            token = app_token()
             gh = GitHub(token)
-            views = {f"{n['repository']['nameWithOwner']}#{n['number']}": pr_view(n) for n in gh.open_prs(GITHUB_USER)}
+            views = {f"{n['repository']['nameWithOwner']}#{n['number']}": pr_view(n) for n in gh.open_prs(OWNER)}
             if not seeded:
                 # First start: PRs already open are marked seen so old PRs don't all get comments at once.
                 reviewed = {k: {"sha": v["sha"], "trigger": v["trigger"], "reply": v["reply"]} for k, v in views.items()}
                 seeded = True
                 save(reviewed)
-                print(f"👀 Watching {GITHUB_USER}; {len(views)} open PRs marked as already seen.", flush=True)
+                print(f"👀 Watching {OWNER}; {len(views)} open PRs marked as already seen.", flush=True)
             for key, view in views.items():
                 seen = reviewed.get(key) or {}
                 if isinstance(seen, str):
