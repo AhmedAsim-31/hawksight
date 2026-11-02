@@ -21,10 +21,16 @@ def _b64(data):
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def app_token(owner):
-    """An installation token for the hawksight app, so comments post as hawksight-bot[bot] instead of the owner."""
+def app_config():
+    """The GitHub App created by create_app.py: id, slug, and the account it reviews for."""
     with open(f"{APP_DIR}/app.json") as f:
-        app_id = json.load(f)["id"]
+        return json.load(f)
+
+
+def app_token():
+    """An installation token for the app, so comments post as <app>[bot] instead of the owner."""
+    app = app_config()
+    app_id, owner = app["id"], app["owner"]
     now = int(time.time())
     claims = json.dumps({"iat": now - 60, "exp": now + 540, "iss": app_id}).encode()
     head = _b64(b'{"alg":"RS256","typ":"JWT"}') + "." + _b64(claims)
@@ -32,9 +38,12 @@ def app_token(owner):
     sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"{APP_DIR}/app.pem"], input=head.encode(),
                          check=True, capture_output=True).stdout
     headers = {"Authorization": f"Bearer {head}.{_b64(sig)}", "Accept": "application/vnd.github+json"}
-    r = requests.get(f"{API}/users/{owner}/installation", headers=headers, timeout=30)
+    r = requests.get(f"{API}/app/installations", headers=headers, timeout=30)
     r.raise_for_status()
-    r = requests.post(f"{API}/app/installations/{r.json()['id']}/access_tokens", headers=headers, timeout=30)
+    ids = [i["id"] for i in r.json() if i["account"]["login"].lower() == owner.lower()]
+    if not ids:
+        raise RuntimeError(f"the app is not installed on {owner}; install it from its GitHub settings page")
+    r = requests.post(f"{API}/app/installations/{ids[0]}/access_tokens", headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()["token"]
 

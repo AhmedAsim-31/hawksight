@@ -2,14 +2,15 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
 import review
-from gh_api import BOT, SUMMARY, GitHub, app_token
+from gh_api import BOT, SUMMARY, GitHub, app_config, app_token
 
-GITHUB_USER = "AhmedAsim-31"
 HOME = os.path.expanduser("~")
 CACHE = f"{HOME}/.hawksight"
 STATE_FILE = f"{CACHE}/reviewed.json"
@@ -20,12 +21,14 @@ CONTEXT_LIMIT = 60000
 PROMPT_CHARS = 75000
 INCLUDE = "**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.astro,**/*.vue,**/*.svelte,**/*.py,**/*.go,**/*.rs,**/*.json,**/*.md,**/*.mdx,**/*.css,**/*.yml,**/*.yaml"
 IGNORE = "node_modules,build,dist,.git,**/package-lock.json,**/pnpm-lock.yaml,**/yarn.lock"
-TRIGGER = "/hawksight"
+OWNER = None  # the account the app reviews for; read from the app config in main()
+MENTION = None  # "@<app-slug>", the comment that asks for a re-review
+MENTION_RE = None
 
 
 def is_owner(comment):
     # Only the owner's comments count, so outsiders can't trigger reviews or steer the model.
-    return (comment["author"] or {}).get("login") == GITHUB_USER
+    return (comment["author"] or {}).get("login") == OWNER
 
 
 def pr_view(node):
@@ -49,7 +52,7 @@ def pr_view(node):
     return {
         "sha": node["headRefOid"],
         "threads": threads,
-        "trigger": max((c["databaseId"] for c in comments if TRIGGER in c["body"] and BOT not in c["body"]),
+        "trigger": max((c["databaseId"] for c in comments if MENTION_RE.search(c["body"]) and BOT not in c["body"]),
                        default=None),
         "reply": max((t["last_reply"] for t in threads if t["last_reply"]), default=None),
         "summary": next((c["databaseId"] for c in comments if SUMMARY in c["body"]), None),
@@ -73,7 +76,10 @@ def checkout_pr(full_name, ref, token):
 
 
 def repomix(path, out, args, stdin=None):
-    subprocess.run(["repomix", "--output", out, *args], cwd=path, input=stdin, text=True,
+    # Full path, because Windows cannot launch the repomix.cmd shim by bare name.
+    # No repomix summary or tree: they list only the packed subset, and the model read that as the whole repo.
+    subprocess.run([shutil.which("repomix") or "repomix", "--output", out, "--no-file-summary",
+                    "--no-directory-structure", *args], cwd=path, input=stdin, text=True,
                    check=True, stdout=subprocess.DEVNULL)
     with open(out) as f:
         return f.read()
@@ -81,14 +87,14 @@ def repomix(path, out, args, stdin=None):
 
 def build_context(path, git_diff, tmp):
     changed = [p for p in re.findall(r"^\+\+\+ b/(.+)$", git_diff, re.M) if os.path.isfile(f"{path}/{p}")]
-    context = ""
-    if changed:
-        context = "CHANGED FILES (full contents):\n" + repomix(path, f"{tmp}/changed.txt", ["--stdin"], "\n".join(changed))
-    rest = repomix(path, f"{tmp}/rest.txt", ["--compress", "--include", INCLUDE, "--ignore", IGNORE])
-    # Every tracked path, so the model doesn't claim a referenced doc or config file is missing.
+    # Every tracked path first, so the model doesn't claim a referenced doc or config file is missing.
     files = subprocess.run(["git", "-C", path, "ls-files"], check=True, capture_output=True, text=True).stdout
-    return (context + "\n\nALL FILES IN THE REPOSITORY:\n" + files[:8000]
-            + "\n\nREST OF REPOSITORY (signatures only):\n" + rest)[:CONTEXT_LIMIT]
+    context = "ALL FILES IN THE REPOSITORY (complete list):\n" + files[:8000]
+    if changed:
+        context += "\n\nCHANGED FILES (full contents):\n" + repomix(path, f"{tmp}/changed.txt", ["--stdin"],
+                                                                     "\n".join(changed))
+    rest = repomix(path, f"{tmp}/rest.txt", ["--compress", "--include", INCLUDE, "--ignore", IGNORE])
+    return (context + "\n\nOTHER FILES (signatures only):\n" + rest)[:CONTEXT_LIMIT]
 
 
 def run_review(gh, repo, pr, view, summary_id, token):
@@ -109,7 +115,7 @@ def run_review(gh, repo, pr, view, summary_id, token):
     open_threads = {f"F{i + 1}": t for i, t in enumerate(t for t in threads if not t["resolved"])}
     existing = [{**t, "id": k} for k, t in open_threads.items()]
     print(f"🧠 Model call ({len(existing)} open findings)...", flush=True)
-    out = review.run_model(review.build_prompt(context, numbered, existing))
+    out = review.run_model(context, numbered, existing)
 
     for item in out["existing"]:
         t = open_threads.get(item["id"])
@@ -140,7 +146,7 @@ def run_review(gh, repo, pr, view, summary_id, token):
                         "severity": f["severity"], "title": f["title"], "line": line})
 
     value = review.score([t["severity"] for t in threads if not t["resolved"]])
-    summary_id, url = gh.upsert_summary(repo, pr, summary_id, review.summary_body(out["summary"], value, threads, sha))
+    summary_id, url = gh.upsert_summary(repo, pr, summary_id, review.summary_body(out["summary"], value, threads, sha, MENTION))
     n_open = sum(not t["resolved"] for t in threads)
     gh.status(repo, sha, "success", f"Score {value}/5 · {n_open} open findings", url)
     print(f"✅ {repo} PR #{pr}: score {value}/5, {n_open} open", flush=True)
@@ -152,52 +158,88 @@ def save(reviewed):
         json.dump(reviewed, f, indent=1)
 
 
+def due(seen, view):
+    """A PR is due when it has a commit, mention of the app or thread reply not yet reviewed."""
+    return not (seen.get("sha") == view["sha"] and view["trigger"] in (None, seen.get("trigger"))
+                and view["reply"] in (None, seen.get("reply")))
+
+
+def update_queue(queue, due_keys):
+    """First in, first out: waiting PRs keep their place and newly due ones join the back."""
+    return [k for k in queue if k in due_keys] + [k for k in due_keys if k not in queue]
+
+
+def queued_label(ahead):
+    return "Queued: next up" if not ahead else f"Queued: {ahead} review{'s' if ahead > 1 else ''} ahead"
+
+
 def main():
+    global OWNER, MENTION, MENTION_RE
+    app = app_config()
+    OWNER, MENTION = app["owner"], f"@{app['slug']}"
+    # Either "@hawksight-bot" or "@hawksightbot" works for a slug like "hawksight-bot".
+    MENTION_RE = re.compile(rf"@({re.escape(app['slug'])}|{re.escape(app['slug'].replace('-', ''))})\b", re.I)
     os.makedirs(CACHE, exist_ok=True)
     seeded = os.path.exists(STATE_FILE)
     reviewed = json.load(open(STATE_FILE)) if seeded else {}
+    # One review at a time; waiting PRs show their place as a pending commit status.
+    queue, shown, not_before = [], {}, {}
     while True:
         try:
-            token = app_token(GITHUB_USER)
+            token = app_token()
             gh = GitHub(token)
-            views = {f"{n['repository']['nameWithOwner']}#{n['number']}": pr_view(n) for n in gh.open_prs(GITHUB_USER)}
+            views = {f"{n['repository']['nameWithOwner']}#{n['number']}": pr_view(n) for n in gh.open_prs(OWNER)}
             if not seeded:
                 # First start: PRs already open are marked seen so old PRs don't all get comments at once.
                 reviewed = {k: {"sha": v["sha"], "trigger": v["trigger"], "reply": v["reply"]} for k, v in views.items()}
                 seeded = True
                 save(reviewed)
-                print(f"👀 Watching {GITHUB_USER}; {len(views)} open PRs marked as already seen.", flush=True)
-            for key, view in views.items():
-                seen = reviewed.get(key) or {}
-                if isinstance(seen, str):
-                    seen = {"sha": seen}
-                if (seen.get("sha") == view["sha"] and view["trigger"] in (None, seen.get("trigger"))
-                        and view["reply"] in (None, seen.get("reply"))):
-                    continue
-                repo, num = key.split("#")
-                entry = {"sha": view["sha"], "trigger": view["trigger"], "reply": view["reply"],
-                         "summary": seen.get("summary") or view["summary"]}
+                print(f"👀 Watching {OWNER}; {len(views)} open PRs marked as already seen.", flush=True)
+            queue = update_queue(queue, [k for k, v in views.items() if due(reviewed.get(k) or {}, v)])
+            for ahead, key in enumerate(queue):
+                label = (views[key]["sha"], queued_label(ahead))
+                if shown.get(key) != label:
+                    gh.status(key.split("#")[0], label[0], "pending", label[1])
+                    shown[key] = label
+            ready = [k for k in queue if not_before.get(k, 0) <= time.time()]
+            if not ready:
+                time.sleep(POLL_SECONDS)
+                continue
+            key, view = ready[0], views[ready[0]]
+            seen = reviewed.get(key) or {}
+            repo, num = key.split("#")
+            entry = {"sha": view["sha"], "trigger": view["trigger"], "reply": view["reply"],
+                     "summary": seen.get("summary") or view["summary"]}
+            queue.remove(key)
+            shown.pop(key, None)
+            try:
+                entry["summary"] = run_review(gh, repo, int(num), view, entry["summary"], token)
+            except Exception as e:
+                # Reruns are safe (resolved threads are skipped, repeats deduped), so retry from the back of the
+                # queue a few times, then give up until a new commit or trigger so a deterministic failure can't loop.
+                fails = seen.get("fails", 0) + 1
+                print(f"❌ Review of {key} failed ({fails}/3): {e}", flush=True)
+                # A reviewer crash is not a code failure, so the status never turns the PR red.
+                state, text = (("pending", f"Review failed ({fails}/3), retrying") if fails < 3 else
+                               ("success", f"Not reviewed after 3 attempts; comment {MENTION} to retry"))
                 try:
-                    entry["summary"] = run_review(gh, repo, int(num), view, entry["summary"], token)
-                except Exception as e:
-                    # Reruns are safe (resolved threads are skipped, repeats deduped), so retry a few polls,
-                    # then give up until a new commit or trigger so a deterministic failure can't loop forever.
-                    fails = seen.get("fails", 0) + 1
-                    print(f"❌ Review of {key} failed ({fails}/3): {e}", flush=True)
-                    try:
-                        gh.status(repo, view["sha"], "error", f"Review failed, comment {TRIGGER} to retry: {e}")
-                    except Exception:
-                        pass
-                    if fails < 3:
-                        reviewed[key] = {**seen, "fails": fails}
-                        save(reviewed)
-                        continue
-                reviewed[key] = entry
-                save(reviewed)
+                    gh.status(repo, view["sha"], state, f"{text}: {e}")
+                except Exception:
+                    pass
+                if fails < 3:
+                    reviewed[key] = {**seen, "fails": fails}
+                    not_before[key] = time.time() + POLL_SECONDS
+                    save(reviewed)
+                    continue
+            reviewed[key] = entry
+            save(reviewed)
         except Exception as e:
             print(f"❌ Poll failed: {e}", flush=True)
-        time.sleep(POLL_SECONDS)
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        # Log file for runners without a console, such as pythonw on Windows.
+        sys.stdout = sys.stderr = open(sys.argv[1], "a", buffering=1)
     main()
