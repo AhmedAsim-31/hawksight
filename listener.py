@@ -2,49 +2,61 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
-import requests
 
-GITHUB_USER = "AhmedAsim-31"
-OLLAMA_URL = "http://localhost:11434/api/generate"
+import review
+from gh_api import BOT, SUMMARY, GitHub, app_config, app_token
+
 HOME = os.path.expanduser("~")
-CACHE = f"{HOME}/.greptile-cache"
+CACHE = f"{HOME}/.hawksight"
 STATE_FILE = f"{CACHE}/reviewed.json"
 # ponytail: 1-minute polling; switch to webhooks behind a fixed tunnel if review latency matters
 POLL_SECONDS = 60
 CONTEXT_LIMIT = 60000
-INCLUDE = "**/*.js,**/*.ts,**/*.py,**/*.json"
-IGNORE = "node_modules,build,dist,.git"
-REVIEW_HEADER = "### 🤖 Local Greptile Review (System Aware)"
-TRIGGER = "@local-greptile"
-SEARCH = """query($q: String!) { search(query: $q, type: ISSUE, first: 100) {
-  nodes { ... on PullRequest { number headRefOid repository { nameWithOwner }
-    comments(last: 30) { nodes { databaseId body author { login } } } } } } }"""
+# ~3.3 chars/token measured: keeps the prompt near 24k tokens so num_predict 6000 fits the 32k window.
+PROMPT_CHARS = 75000
+INCLUDE = "**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.astro,**/*.vue,**/*.svelte,**/*.py,**/*.go,**/*.rs,**/*.json,**/*.md,**/*.mdx,**/*.css,**/*.yml,**/*.yaml"
+IGNORE = "node_modules,build,dist,.git,**/package-lock.json,**/pnpm-lock.yaml,**/yarn.lock"
+OWNER = None  # the account the app reviews for; read from the app config in main()
+MENTION = None  # "@<app-slug>", the comment that asks for a re-review
+MENTION_RE = None
 
 
-def github_token():
-    return subprocess.run(
-        ["/opt/homebrew/bin/gh", "auth", "token", "--user", GITHUB_USER],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
+def is_owner(comment):
+    # Only the owner's comments count, so outsiders can't trigger reviews or steer the model.
+    return (comment["author"] or {}).get("login") == OWNER
 
 
-def open_prs(headers):
-    r = requests.post("https://api.github.com/graphql", headers=headers, timeout=30, json={
-        "query": SEARCH, "variables": {"q": f"is:pr is:open archived:false user:{GITHUB_USER}"}})
-    r.raise_for_status()
-    prs = {}
-    for n in r.json()["data"]["search"]["nodes"]:
-        # Only the owner's comments count, so outsiders can't trigger reviews or steer the model.
-        mine = [c for c in n["comments"]["nodes"] if (c["author"] or {}).get("login") == GITHUB_USER]
-        triggers = [c["databaseId"] for c in mine if TRIGGER in c["body"] and not c["body"].startswith(REVIEW_HEADER)]
-        last_review = max((i for i, c in enumerate(mine) if c["body"].startswith(REVIEW_HEADER)), default=None)
-        thread = "\n\n---\n\n".join(c["body"] for c in mine[last_review:]) if last_review is not None else ""
-        prs[f"{n['repository']['nameWithOwner']}#{n['number']}"] = {
-            "sha": n["headRefOid"], "trigger": max(triggers, default=None), "thread": thread}
-    return prs
+def pr_view(node):
+    """The reviewer's finding threads on a PR, plus the comment ids that should start a review."""
+    threads = []
+    for t in node["reviewThreads"]["nodes"]:
+        cs = t["comments"]["nodes"]
+        meta = review.parse_finding(cs[0]["body"]) if cs else None
+        if not meta:
+            continue
+        last_bot = max(i for i, c in enumerate(cs) if BOT in c["body"])
+        human = [c for c in cs if is_owner(c) and BOT not in c["body"]]
+        threads.append({
+            "id": t["id"], "root": cs[0]["databaseId"], "url": cs[0]["url"], "path": t["path"], "line": t["line"],
+            "resolved": t["isResolved"], "severity": meta["severity"], "title": meta["title"],
+            "body": cs[0]["body"].split("\n\n<!--")[0],
+            "replies": [c["body"] for c in cs[last_bot + 1:] if c in human],
+            "last_reply": max((c["databaseId"] for c in human), default=None),
+        })
+    comments = [c for c in node["comments"]["nodes"] if is_owner(c)]
+    return {
+        "sha": node["headRefOid"],
+        "threads": threads,
+        "trigger": max((c["databaseId"] for c in comments if MENTION_RE.search(c["body"]) and BOT not in c["body"]),
+                       default=None),
+        "reply": max((t["last_reply"] for t in threads if t["last_reply"]), default=None),
+        "summary": next((c["databaseId"] for c in comments if SUMMARY in c["body"]), None),
+    }
 
 
 def checkout_pr(full_name, ref, token):
@@ -56,14 +68,18 @@ def checkout_pr(full_name, ref, token):
     git = ["git", "-C", path]
     if not os.path.isdir(f"{path}/.git"):
         subprocess.run(["git", "init", "-q", path], check=True)
-    subprocess.run(git + ["fetch", "-q", "--depth", "1", f"https://github.com/{full_name}.git", ref], check=True, env=env)
+    subprocess.run(git + ["fetch", "-q", "--depth", "1", f"https://github.com/{full_name}.git", ref], check=True, env=env,
+                   timeout=300)
     subprocess.run(git + ["checkout", "-q", "-f", "FETCH_HEAD"], check=True)
     subprocess.run(git + ["clean", "-qfdx"], check=True)
     return path
 
 
 def repomix(path, out, args, stdin=None):
-    subprocess.run(["repomix", "--output", out, *args], cwd=path, input=stdin, text=True,
+    # Full path, because Windows cannot launch the repomix.cmd shim by bare name.
+    # No repomix summary or tree: they list only the packed subset, and the model read that as the whole repo.
+    subprocess.run([shutil.which("repomix") or "repomix", "--output", out, "--no-file-summary",
+                    "--no-directory-structure", *args], cwd=path, input=stdin, text=True,
                    check=True, stdout=subprocess.DEVNULL)
     with open(out) as f:
         return f.read()
@@ -71,65 +87,70 @@ def repomix(path, out, args, stdin=None):
 
 def build_context(path, git_diff, tmp):
     changed = [p for p in re.findall(r"^\+\+\+ b/(.+)$", git_diff, re.M) if os.path.isfile(f"{path}/{p}")]
-    context = ""
+    # Every tracked path first, so the model doesn't claim a referenced doc or config file is missing.
+    files = subprocess.run(["git", "-C", path, "ls-files"], check=True, capture_output=True, text=True).stdout
+    context = "ALL FILES IN THE REPOSITORY (complete list):\n" + files[:8000]
     if changed:
-        context = "CHANGED FILES (full contents):\n" + repomix(path, f"{tmp}/changed.txt", ["--stdin"], "\n".join(changed))
+        context += "\n\nCHANGED FILES (full contents):\n" + repomix(path, f"{tmp}/changed.txt", ["--stdin"],
+                                                                     "\n".join(changed))
     rest = repomix(path, f"{tmp}/rest.txt", ["--compress", "--include", INCLUDE, "--ignore", IGNORE])
-    return (context + "\n\nREST OF REPOSITORY (signatures only):\n" + rest)[:CONTEXT_LIMIT]
+    return (context + "\n\nOTHER FILES (signatures only):\n" + rest)[:CONTEXT_LIMIT]
 
 
-def set_status(full_name, sha, headers, state, description, target_url=None):
-    requests.post(f"https://api.github.com/repos/{full_name}/statuses/{sha}", headers=headers, timeout=30, json={
-        "state": state, "context": "local-greptile", "description": description[:140], "target_url": target_url,
-    }).raise_for_status()
-
-
-def review(full_name, pr_num, sha, thread, headers, token):
-    api = f"https://api.github.com/repos/{full_name}"
-    set_status(full_name, sha, headers, "pending", "Reviewing with local-greptile-pro...")
-    print(f"🚀 Fetching live diff for {full_name} PR #{pr_num}...", flush=True)
-    diff = requests.get(f"{api}/pulls/{pr_num}", timeout=30,
-                        headers={**headers, "Accept": "application/vnd.github.v3.diff"})
-    diff.raise_for_status()
-    git_diff = diff.text
-
-    print(f"📁 Packing system-wide repository context for {full_name}...", flush=True)
-    repo_context = "No system-wide context mapped."
+def run_review(gh, repo, pr, view, summary_id, token):
+    sha, threads = view["sha"], view["threads"]
+    gh.status(repo, sha, "pending", "Reviewing...")
+    print(f"🚀 Reviewing {repo} PR #{pr} at {sha[:7]}...", flush=True)
+    diff = gh.diff(repo, pr)
+    numbered, valid = review.number_diff(diff)
+    context = "No system-wide context mapped."
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            path = checkout_pr(full_name, f"pull/{pr_num}/head", token)
-            repo_context = build_context(path, git_diff, tmp)
+            context = build_context(checkout_pr(repo, f"pull/{pr}/head", token), diff, tmp)
     except Exception as e:
         print(f"⚠️ Repomix context extraction skipped: {e}", flush=True)
 
-    print("🧠 Processing diff with Local Greptile-Pro Engine...", flush=True)
-    combined_prompt = f"""
-    SYSTEM ARCHITECTURE AND REPOSITORY CONTEXT:
-    {repo_context}
+    # ponytail: a diff over PROMPT_CHARS alone still overflows; chunk the diff per file if that happens.
+    context = context[:max(0, PROMPT_CHARS - len(numbered))]
+    open_threads = {f"F{i + 1}": t for i, t in enumerate(t for t in threads if not t["resolved"])}
+    existing = [{**t, "id": k} for k, t in open_threads.items()]
+    print(f"🧠 Model call ({len(existing)} open findings)...", flush=True)
+    out = review.run_model(context, numbered, existing)
 
-    =========================================
-    LIVE CHANGES (PULL REQUEST DIFF):
-    {git_diff}
-    """
-    if thread:
-        combined_prompt += f"""
-    =========================================
-    YOUR PREVIOUS REVIEW AND THE AUTHOR'S REPLIES:
-    {thread}
+    for item in out["existing"]:
+        t = open_threads.get(item["id"])
+        if not t:
+            continue
+        if item["status"] in ("fixed", "rebutted"):
+            gh.reply(repo, pr, t["root"], review.bot(f"✅ Resolved ({item['status']}): {item['reply']}".strip()))
+            gh.resolve(t["id"])
+            t["resolved"] = True
+        elif t["replies"] and item["reply"]:
+            gh.reply(repo, pr, t["root"], review.bot(item["reply"]))
 
-    This is a re-review. Drop findings the current diff fixes or the author's replies convincingly rebut.
-    Keep findings that still apply. Under the findings, add a "Responses" list answering each reply in one line.
-    """
-    ollama = requests.post(OLLAMA_URL, json={"model": "local-greptile-pro", "prompt": combined_prompt, "stream": False})
-    ollama.raise_for_status()
-    review_markdown = ollama.json()["response"]
+    for f in out["new"]:
+        if f["path"] not in valid or f["severity"] not in review.SEVERITIES:
+            continue
+        line = f["line"] if f["line"] in valid[f["path"]] else None
+        # ponytail: same file within 2 lines counts as a repeat (resolved ones included, so rebuttals stick);
+        # compare titles too if distinct bugs on adjacent lines get swallowed.
+        if any(t["path"] == f["path"] and line and t["line"] and abs(t["line"] - line) <= 2 for t in threads):
+            continue
+        real, reason = review.verify(context, numbered, f)
+        print(f"{'✔️ kept' if real else '🗑️ dropped'} {f['severity']} {f['path']}:{f['line']} {f['title']}: {reason}",
+              flush=True)
+        if not real:
+            continue
+        c = gh.inline(repo, pr, sha, f["path"], line, review.finding_body(f))
+        threads.append({"url": c["html_url"], "path": f["path"], "resolved": False,
+                        "severity": f["severity"], "title": f["title"], "line": line})
 
-    print("📤 Posting findings directly onto the GitHub PR...", flush=True)
-    gh = requests.post(f"{api}/issues/{pr_num}/comments", headers=headers, timeout=30,
-                       json={"body": f"{REVIEW_HEADER}\n\n{review_markdown}"})
-    gh.raise_for_status()
-    set_status(full_name, sha, headers, "success", "Review posted", gh.json()["html_url"])
-    print(f"✅ Review posted successfully to {full_name} PR #{pr_num}!", flush=True)
+    value = review.score([t["severity"] for t in threads if not t["resolved"]])
+    summary_id, url = gh.upsert_summary(repo, pr, summary_id, review.summary_body(out["summary"], value, threads, sha, MENTION))
+    n_open = sum(not t["resolved"] for t in threads)
+    gh.status(repo, sha, "success", f"Score {value}/5 · {n_open} open findings", url)
+    print(f"✅ {repo} PR #{pr}: score {value}/5, {n_open} open", flush=True)
+    return summary_id
 
 
 def save(reviewed):
@@ -137,42 +158,88 @@ def save(reviewed):
         json.dump(reviewed, f, indent=1)
 
 
+def due(seen, view):
+    """A PR is due when it has a commit, mention of the app or thread reply not yet reviewed."""
+    return not (seen.get("sha") == view["sha"] and view["trigger"] in (None, seen.get("trigger"))
+                and view["reply"] in (None, seen.get("reply")))
+
+
+def update_queue(queue, due_keys):
+    """First in, first out: waiting PRs keep their place and newly due ones join the back."""
+    return [k for k in queue if k in due_keys] + [k for k in due_keys if k not in queue]
+
+
+def queued_label(ahead):
+    return "Queued: next up" if not ahead else f"Queued: {ahead} review{'s' if ahead > 1 else ''} ahead"
+
+
 def main():
+    global OWNER, MENTION, MENTION_RE
+    app = app_config()
+    OWNER, MENTION = app["owner"], f"@{app['slug']}"
+    # Either "@hawksight-bot" or "@hawksightbot" works for a slug like "hawksight-bot".
+    MENTION_RE = re.compile(rf"@({re.escape(app['slug'])}|{re.escape(app['slug'].replace('-', ''))})\b", re.I)
     os.makedirs(CACHE, exist_ok=True)
     seeded = os.path.exists(STATE_FILE)
     reviewed = json.load(open(STATE_FILE)) if seeded else {}
+    # One review at a time; waiting PRs show their place as a pending commit status.
+    queue, shown, not_before = [], {}, {}
     while True:
         try:
-            token = github_token()
-            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-            prs = open_prs(headers)
+            token = app_token()
+            gh = GitHub(token)
+            views = {f"{n['repository']['nameWithOwner']}#{n['number']}": pr_view(n) for n in gh.open_prs(OWNER)}
             if not seeded:
                 # First start: PRs already open are marked seen so old PRs don't all get comments at once.
-                reviewed, seeded = {k: {"sha": p["sha"], "trigger": p["trigger"]} for k, p in prs.items()}, True
+                reviewed = {k: {"sha": v["sha"], "trigger": v["trigger"], "reply": v["reply"]} for k, v in views.items()}
+                seeded = True
                 save(reviewed)
-                print(f"👀 Watching {GITHUB_USER}; {len(prs)} open PRs marked as already seen.", flush=True)
-            for key, pr in prs.items():
-                seen = reviewed.get(key) or {}
-                if isinstance(seen, str):
-                    seen = {"sha": seen, "trigger": None}
-                if seen.get("sha") == pr["sha"] and (pr["trigger"] is None or pr["trigger"] == seen.get("trigger")):
-                    continue
-                full_name, num = key.split("#")
-                sha = pr["sha"]
+                print(f"👀 Watching {OWNER}; {len(views)} open PRs marked as already seen.", flush=True)
+            queue = update_queue(queue, [k for k, v in views.items() if due(reviewed.get(k) or {}, v)])
+            for ahead, key in enumerate(queue):
+                label = (views[key]["sha"], queued_label(ahead))
+                if shown.get(key) != label:
+                    gh.status(key.split("#")[0], label[0], "pending", label[1])
+                    shown[key] = label
+            ready = [k for k in queue if not_before.get(k, 0) <= time.time()]
+            if not ready:
+                time.sleep(POLL_SECONDS)
+                continue
+            key, view = ready[0], views[ready[0]]
+            seen = reviewed.get(key) or {}
+            repo, num = key.split("#")
+            entry = {"sha": view["sha"], "trigger": view["trigger"], "reply": view["reply"],
+                     "summary": seen.get("summary") or view["summary"]}
+            queue.remove(key)
+            shown.pop(key, None)
+            try:
+                entry["summary"] = run_review(gh, repo, int(num), view, entry["summary"], token)
+            except Exception as e:
+                # Reruns are safe (resolved threads are skipped, repeats deduped), so retry from the back of the
+                # queue a few times, then give up until a new commit or trigger so a deterministic failure can't loop.
+                fails = seen.get("fails", 0) + 1
+                print(f"❌ Review of {key} failed ({fails}/3): {e}", flush=True)
+                # A reviewer crash is not a code failure, so the status never turns the PR red.
+                state, text = (("pending", f"Review failed ({fails}/3), retrying") if fails < 3 else
+                               ("success", f"Not reviewed after 3 attempts; comment {MENTION} to retry"))
                 try:
-                    review(full_name, int(num), sha, pr["thread"], headers, token)
-                    reviewed[key] = {"sha": sha, "trigger": pr["trigger"]}
+                    gh.status(repo, view["sha"], state, f"{text}: {e}")
+                except Exception:
+                    pass
+                if fails < 3:
+                    reviewed[key] = {**seen, "fails": fails}
+                    not_before[key] = time.time() + POLL_SECONDS
                     save(reviewed)
-                except Exception as e:
-                    print(f"❌ Review of {key} failed, retrying next poll: {e}", flush=True)
-                    try:
-                        set_status(full_name, sha, headers, "error", f"Review failed, retrying: {e}")
-                    except Exception:
-                        pass
+                    continue
+            reviewed[key] = entry
+            save(reviewed)
         except Exception as e:
             print(f"❌ Poll failed: {e}", flush=True)
-        time.sleep(POLL_SECONDS)
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        # Log file for runners without a console, such as pythonw on Windows.
+        sys.stdout = sys.stderr = open(sys.argv[1], "a", buffering=1)
     main()
