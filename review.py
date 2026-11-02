@@ -4,9 +4,9 @@ import re
 import requests
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "local-greptile-pro"
+MODEL = "hawksight"
 SEVERITIES = ("P0", "P1", "P2")
-FINDING_RE = re.compile(r"<!-- local-greptile:finding (\{.*?\}) -->")
+FINDING_RE = re.compile(r"<!-- hawksight:finding (\{.*?\}) -->")
 TASK = """TASK:
 1. For each existing finding, decide its status: "fixed" if the current code no longer has the problem, "rebutted" if the author's reply convincingly shows it is not a problem, otherwise "open". Write a one-line reply to the author when the status is not "open" or the author replied; otherwise write "-".
 2. List new problems. Never repeat an existing finding. Each needs the file path, a line number taken from the numbered diff, a severity, a short title, and a markdown body that explains what goes wrong and shows the fix once.
@@ -14,6 +14,8 @@ TASK = """TASK:
    - P0 (Critical): security vulnerabilities (SQL injection, XSS, exposed tokens or keys), data loss, crashes on a main path.
    - P1 (Important): logic errors, race conditions (check-then-act), unawaited promises, missing edge-case handling.
    - P2 (Minor): small bugs, redundant code, maintainability issues. Never style a formatter or linter enforces.
+   Diff lines starting with "-" are removed code: never report them as the current state.
+   Never flag a deliberate removal, a wording or grammar preference, or something you admit is not a bug.
 3. Write a two-sentence summary of what the PR does and its main risk.
 
 Answer in exactly this format and nothing else:
@@ -137,7 +139,7 @@ def run_model(prompt):
 
 def finding_body(f):
     meta = json.dumps({"severity": f["severity"], "title": f["title"]})
-    return f"**{f['severity']}** · {f['title']}\n\n{f['body']}\n\n<!-- local-greptile:finding {meta} -->"
+    return f"**{f['severity']}** · {f['title']}\n\n{f['body']}\n\n<!-- hawksight:finding {meta} -->"
 
 
 def parse_finding(body):
@@ -146,7 +148,7 @@ def parse_finding(body):
 
 
 def bot(text):
-    return f"{text}\n\n<!-- local-greptile -->"
+    return f"{text}\n\n<!-- hawksight -->"
 
 
 def summary_body(summary, value, threads, sha):
@@ -156,8 +158,8 @@ def summary_body(summary, value, threads, sha):
         f"| {t['severity']} | [{t['title']}]({t['url']}) `{t['path']}` | {'✅ resolved' if t['resolved'] else '🔴 open'} |"
         for t in sorted(threads, key=lambda t: (t["resolved"], t["severity"])))
     table = f"| Severity | Finding | Status |\n|---|---|---|\n{rows}" if rows else "No findings."
-    return f"""<!-- local-greptile:summary -->
-### 🤖 Local Greptile Review
+    return f"""<!-- hawksight:summary -->
+### 🦅 hawksight review
 
 **Score: {value}/5** · open: {counts} · reviewed `{sha[:7]}`
 
@@ -165,7 +167,7 @@ def summary_body(summary, value, threads, sha):
 
 {table}
 
-<sub>5/5 needs every finding resolved and no new ones. Reply in a finding's thread to discuss it; push a commit or comment `@local-greptile` to re-review.</sub>"""
+<sub>5/5 needs every finding resolved and no new ones. Reply in a finding's thread to discuss it; push a commit or comment `/hawksight` to re-review.</sub>"""
 
 
 if __name__ == "__main__":

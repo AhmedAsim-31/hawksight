@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.ahmedasim.greptile</string>
+    <string>com.ahmedasim.hawksight</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/ahmedkhan/local-greptile/listener.py</string>
+        <string>/Users/ahmedkhan/hawksight/listener.py</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -19,8 +19,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/greptile_listener.log</string>
+    <string>/tmp/hawksight.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/greptile_listener.err</string>
+    <string>/tmp/hawksight.err</string>
 </dict>
 </plist>

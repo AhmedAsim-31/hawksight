@@ -7,25 +7,18 @@ import tempfile
 import time
 
 import review
-from gh_api import BOT, SUMMARY, GitHub
+from gh_api import BOT, SUMMARY, GitHub, app_token
 
 GITHUB_USER = "AhmedAsim-31"
 HOME = os.path.expanduser("~")
-CACHE = f"{HOME}/.greptile-cache"
+CACHE = f"{HOME}/.hawksight"
 STATE_FILE = f"{CACHE}/reviewed.json"
 # ponytail: 1-minute polling; switch to webhooks behind a fixed tunnel if review latency matters
 POLL_SECONDS = 60
 CONTEXT_LIMIT = 60000
-INCLUDE = "**/*.js,**/*.ts,**/*.py,**/*.json"
-IGNORE = "node_modules,build,dist,.git"
-TRIGGER = "@local-greptile"
-
-
-def github_token():
-    return subprocess.run(
-        ["/opt/homebrew/bin/gh", "auth", "token", "--user", GITHUB_USER],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
+INCLUDE = "**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.astro,**/*.vue,**/*.svelte,**/*.py,**/*.go,**/*.rs,**/*.json,**/*.md,**/*.mdx,**/*.css,**/*.yml,**/*.yaml"
+IGNORE = "node_modules,build,dist,.git,**/package-lock.json,**/pnpm-lock.yaml,**/yarn.lock"
+TRIGGER = "/hawksight"
 
 
 def is_owner(comment):
@@ -98,7 +91,7 @@ def build_context(path, git_diff, tmp):
 
 def run_review(gh, repo, pr, view, summary_id, token):
     sha, threads = view["sha"], view["threads"]
-    gh.status(repo, sha, "pending", "Reviewing with local-greptile-pro...")
+    gh.status(repo, sha, "pending", "Reviewing...")
     print(f"🚀 Reviewing {repo} PR #{pr} at {sha[:7]}...", flush=True)
     diff = gh.diff(repo, pr)
     numbered, valid = review.number_diff(diff)
@@ -156,7 +149,7 @@ def main():
     reviewed = json.load(open(STATE_FILE)) if seeded else {}
     while True:
         try:
-            token = github_token()
+            token = app_token(GITHUB_USER)
             gh = GitHub(token)
             views = {f"{n['repository']['nameWithOwner']}#{n['number']}": pr_view(n) for n in gh.open_prs(GITHUB_USER)}
             if not seeded:

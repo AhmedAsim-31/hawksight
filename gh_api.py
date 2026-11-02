@@ -1,13 +1,42 @@
+import base64
+import json
+import os
+import subprocess
+import time
+
 import requests
 
 API = "https://api.github.com"
-BOT = "<!-- local-greptile"
-SUMMARY = "<!-- local-greptile:summary -->"
+APP_DIR = os.path.expanduser("~/.hawksight")
+BOT = "<!-- hawksight"
+SUMMARY = "<!-- hawksight:summary -->"
 SEARCH = """query($q: String!) { search(query: $q, type: ISSUE, first: 50) {
   nodes { ... on PullRequest { number headRefOid repository { nameWithOwner }
     comments(last: 50) { nodes { databaseId body author { login } } }
     reviewThreads(first: 100) { nodes { id isResolved path line
       comments(first: 50) { nodes { databaseId body url author { login } } } } } } } } }"""
+
+
+def _b64(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def app_token(owner):
+    """An installation token for the hawksight app, so comments post as hawksight-bot[bot] instead of the owner."""
+    with open(f"{APP_DIR}/app.json") as f:
+        app_id = json.load(f)["id"]
+    now = int(time.time())
+    claims = json.dumps({"iat": now - 60, "exp": now + 540, "iss": app_id}).encode()
+    head = _b64(b'{"alg":"RS256","typ":"JWT"}') + "." + _b64(claims)
+    # openssl signs the JWT so the reviewer needs no crypto dependency.
+    sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"{APP_DIR}/app.pem"], input=head.encode(),
+                         check=True, capture_output=True).stdout
+    headers = {"Authorization": f"Bearer {head}.{_b64(sig)}", "Accept": "application/vnd.github+json"}
+    r = requests.get(f"{API}/users/{owner}/installation", headers=headers, timeout=30)
+    r.raise_for_status()
+    r = requests.post(f"{API}/app/installations/{r.json()['id']}/access_tokens", headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()["token"]
 
 
 class GitHub:
@@ -35,7 +64,7 @@ class GitHub:
 
     def status(self, repo, sha, state, description, url=None):
         self.call("POST", f"/repos/{repo}/statuses/{sha}", json={
-            "state": state, "context": "local-greptile", "description": description[:140], "target_url": url})
+            "state": state, "context": "hawksight", "description": description[:140], "target_url": url})
 
     def inline(self, repo, pr, sha, path, line, body):
         # A line outside the diff hunks is rejected by GitHub, so those findings attach to the file instead.
