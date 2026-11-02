@@ -13,6 +13,8 @@ Your code goes to GitHub and nowhere else: the model runs locally through Ollama
 - **A score out of 5, computed from open findings**, not guessed by the model: 5 means nothing is open, 4 only P2, 3 a P1, 2 one P0, and 1 two or more P0.
   A 5/5 needs every finding resolved and no new ones.
 - **A commit status** (`hawksight`) shows progress, then the score with a link to the summary.
+- **One review at a time.**
+  Pull requests waiting their turn show a pending status with their place in the queue, such as "Queued: 2 reviews ahead".
 - **Comments come from your own GitHub App**, so they show as `<your-app>[bot]`, not as you.
 
 ## Re-reviews
@@ -107,7 +109,7 @@ With more memory, a larger model such as Qwen3.6-35B-A3B should review noticeabl
 - A 9B model still produces some false positives and misses some bugs, especially on large diffs.
   The verification pass removes most of the noise, but it cannot add bugs the review missed.
 - Diffs larger than about 75,000 characters leave no room for repository context and can overflow the model's window.
-- Reviews take 1 to 3 minutes each, one at a time.
+- Reviews take 1 to 3 minutes each, one at a time, so a busy queue can take a while.
 - macOS only, because of the LaunchAgent.
   `listener.py` itself runs anywhere Python and Ollama do.
 - Tested on personal accounts.
@@ -116,6 +118,7 @@ With more memory, a larger model such as Qwen3.6-35B-A3B should review noticeabl
 ## Development
 
 `python3 review.py` runs the self-check: diff numbering, score, finding markers, and the output and verdict parsers.
+`python3 test_listener.py` checks when a PR is due for review and the queue order.
 
 ## License
 

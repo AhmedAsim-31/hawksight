@@ -152,12 +152,29 @@ def save(reviewed):
         json.dump(reviewed, f, indent=1)
 
 
+def due(seen, view):
+    """A PR is due when it has a commit, /hawksight comment or thread reply not yet reviewed."""
+    return not (seen.get("sha") == view["sha"] and view["trigger"] in (None, seen.get("trigger"))
+                and view["reply"] in (None, seen.get("reply")))
+
+
+def update_queue(queue, due_keys):
+    """First in, first out: waiting PRs keep their place and newly due ones join the back."""
+    return [k for k in queue if k in due_keys] + [k for k in due_keys if k not in queue]
+
+
+def queued_label(ahead):
+    return "Queued: next up" if not ahead else f"Queued: {ahead} review{'s' if ahead > 1 else ''} ahead"
+
+
 def main():
     global OWNER
     OWNER = app_config()["owner"]
     os.makedirs(CACHE, exist_ok=True)
     seeded = os.path.exists(STATE_FILE)
     reviewed = json.load(open(STATE_FILE)) if seeded else {}
+    # One review at a time; waiting PRs show their place as a pending commit status.
+    queue, shown, not_before = [], {}, {}
     while True:
         try:
             token = app_token()
@@ -169,36 +186,44 @@ def main():
                 seeded = True
                 save(reviewed)
                 print(f"👀 Watching {OWNER}; {len(views)} open PRs marked as already seen.", flush=True)
-            for key, view in views.items():
-                seen = reviewed.get(key) or {}
-                if isinstance(seen, str):
-                    seen = {"sha": seen}
-                if (seen.get("sha") == view["sha"] and view["trigger"] in (None, seen.get("trigger"))
-                        and view["reply"] in (None, seen.get("reply"))):
-                    continue
-                repo, num = key.split("#")
-                entry = {"sha": view["sha"], "trigger": view["trigger"], "reply": view["reply"],
-                         "summary": seen.get("summary") or view["summary"]}
+            queue = update_queue(queue, [k for k, v in views.items() if due(reviewed.get(k) or {}, v)])
+            for ahead, key in enumerate(queue):
+                label = (views[key]["sha"], queued_label(ahead))
+                if shown.get(key) != label:
+                    gh.status(key.split("#")[0], label[0], "pending", label[1])
+                    shown[key] = label
+            ready = [k for k in queue if not_before.get(k, 0) <= time.time()]
+            if not ready:
+                time.sleep(POLL_SECONDS)
+                continue
+            key, view = ready[0], views[ready[0]]
+            seen = reviewed.get(key) or {}
+            repo, num = key.split("#")
+            entry = {"sha": view["sha"], "trigger": view["trigger"], "reply": view["reply"],
+                     "summary": seen.get("summary") or view["summary"]}
+            queue.remove(key)
+            shown.pop(key, None)
+            try:
+                entry["summary"] = run_review(gh, repo, int(num), view, entry["summary"], token)
+            except Exception as e:
+                # Reruns are safe (resolved threads are skipped, repeats deduped), so retry from the back of the
+                # queue a few times, then give up until a new commit or trigger so a deterministic failure can't loop.
+                fails = seen.get("fails", 0) + 1
+                print(f"❌ Review of {key} failed ({fails}/3): {e}", flush=True)
                 try:
-                    entry["summary"] = run_review(gh, repo, int(num), view, entry["summary"], token)
-                except Exception as e:
-                    # Reruns are safe (resolved threads are skipped, repeats deduped), so retry a few polls,
-                    # then give up until a new commit or trigger so a deterministic failure can't loop forever.
-                    fails = seen.get("fails", 0) + 1
-                    print(f"❌ Review of {key} failed ({fails}/3): {e}", flush=True)
-                    try:
-                        gh.status(repo, view["sha"], "error", f"Review failed, comment {TRIGGER} to retry: {e}")
-                    except Exception:
-                        pass
-                    if fails < 3:
-                        reviewed[key] = {**seen, "fails": fails}
-                        save(reviewed)
-                        continue
-                reviewed[key] = entry
-                save(reviewed)
+                    gh.status(repo, view["sha"], "error", f"Review failed, comment {TRIGGER} to retry: {e}")
+                except Exception:
+                    pass
+                if fails < 3:
+                    reviewed[key] = {**seen, "fails": fails}
+                    not_before[key] = time.time() + POLL_SECONDS
+                    save(reviewed)
+                    continue
+            reviewed[key] = entry
+            save(reviewed)
         except Exception as e:
             print(f"❌ Poll failed: {e}", flush=True)
-        time.sleep(POLL_SECONDS)
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
