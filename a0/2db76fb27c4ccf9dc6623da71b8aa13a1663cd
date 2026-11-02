@@ -1,0 +1,19 @@
+listener.py
+  s_57f2057725f135::t_9308c32b7f3946 155-169,176-177,189-212,214-223,226
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a02db76fb27c4ccf9dc6623da71b8aa13a1663cd",
+  "prompts": {},
+  "sessions": {
+    "s_57f2057725f135": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c1297f9-9622-4a85-a65f-bd41be99f644",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ahmed Asim <ahmedk082@gmail.com>"
+    }
+  }
+}
